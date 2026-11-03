@@ -954,10 +954,10 @@ describe("App console", () => {
     expect(screen.getByRole("checkbox", { name: "自动重连" })).toBeChecked();
 
     expect(screen.getByRole("region", { name: "画面源" })).toBeInTheDocument();
-    // 画面源按钮名称现含分辨率/信号标注（如“画面 1 无信号”），用前缀匹配定位。
-    expect(screen.getByRole("button", { name: /^画面 1/ })).toHaveAttribute("aria-pressed", "true");
-    await user.click(screen.getByRole("button", { name: /^画面 2/ }));
-    expect(screen.getByRole("button", { name: /^画面 2/ })).toHaveAttribute("aria-pressed", "true");
+    // 没有收到被控端屏幕清单时退回按视频轨展示，按钮命名为「显示器 N」。
+    expect(screen.getByRole("button", { name: /^显示器 1/ })).toHaveAttribute("aria-pressed", "true");
+    await user.click(screen.getByRole("button", { name: /^显示器 2/ }));
+    expect(screen.getByRole("button", { name: /^显示器 2/ })).toHaveAttribute("aria-pressed", "true");
 
     await user.click(screen.getByRole("button", { name: "读取剪贴板" }));
     await waitFor(() => {

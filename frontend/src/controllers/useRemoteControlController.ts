@@ -5,6 +5,7 @@ import { useMatch, useNavigate } from "react-router";
 import {
   STREAMER_CONTROL_CONNECT_TYPES,
   STREAMER_DATA_CHANNEL_LABELS,
+  STREAMER_DEFAULT_BROWSER_VIRTUAL_DISPLAY_MODE,
   analyzeRemoteSignalReadiness,
   buildDefaultStreamerConnectOptionsBase64,
   buildStreamerControlStreamerDataJson,
@@ -105,6 +106,12 @@ const REMOTE_ASSISTANCE_DEFAULT_TARGET_PLATFORM = 1;
 // 需要“按住保持”的修饰键(用于组合键);其余键采用瞬时一击。event.key 取值见 KeyboardEvent.key 规范。
 const HOLD_MODIFIER_KEYS = new Set(["Shift", "Control", "Alt", "Meta", "AltGraph"]);
 
+// 申请虚拟屏时给的初始分辨率：与官方主控端的默认档位保持一致(1920x1080)。
+const VIRTUAL_SCREEN_INIT_RESOLUTION = {
+  width: STREAMER_DEFAULT_BROWSER_VIRTUAL_DISPLAY_MODE.width,
+  height: STREAMER_DEFAULT_BROWSER_VIRTUAL_DISPLAY_MODE.height,
+} as const;
+
 function readAutoConnectPref(): boolean {
   try {
     return globalThis.localStorage?.getItem("uurc.autoConnect") !== "false";
@@ -203,8 +210,7 @@ export function useRemoteControlController() {
   const browserRemoteSession = useRef<BrowserRemoteSession | null>(null);
   const remoteStageRef = useRef<HTMLDivElement | null>(null);
   const remoteStageFrameRef = useRef<HTMLDivElement | null>(null);
-  const autoConnectAttemptedDeviceRef = useRef<string>("");
-  const controlChannelOpenedRef = useRef(false);
+  const autoConnectAttemptedDeviceRef = useRef<string>("");  const controlChannelOpenedRef = useRef(false);
   const gamepadSamplerRef = useRef(createGamepadInputSampler());
   const gamepadAnimationFrameRef = useRef<number | null>(null);
   const gamepadUiStateRef = useRef({ supported: gamepadSupported, connectedName: "", active: false });
@@ -713,7 +719,9 @@ export function useRemoteControlController() {
     setBrowserRemoteState(closedState ?? createIdleBrowserRemoteState());
   }
 
-  async function startBrowserRemoteSession(options: { skipReadinessCheck?: boolean; forceRelay?: boolean } = {}) {
+  async function startBrowserRemoteSession(
+    options: { skipReadinessCheck?: boolean; forceRelay?: boolean; forceVirtualDisplay?: boolean } = {},
+  ) {
     if (!authStatus?.deviceId) throw new Error("登录已失效");
     if (!selectedDeviceId) throw new Error("请选择设备");
     if (!options.skipReadinessCheck && !roomReadyForBrowserRtc) throw new Error(browserRtcBlockedReason);
@@ -738,6 +746,9 @@ export function useRemoteControlController() {
       appDataBase64: buildDefaultStreamerConnectOptionsBase64({
         deviceId: authStatus.deviceId,
         controlConnectType,
+        // 虚拟屏只能通过建连参数申请：被控端据此在会话建立时就补一块虚拟显示器。
+        forceVirtualDisplay: options.forceVirtualDisplay === true,
+        virtualDisplayInitResolution: options.forceVirtualDisplay ? VIRTUAL_SCREEN_INIT_RESOLUTION : null,
       }),
       streamerData: buildStreamerControlStreamerDataJson({ controlId: appControlId }),
       forceRelay: options.forceRelay ?? (connectionRouteMode === "relay" ? true : undefined),
@@ -848,6 +859,48 @@ export function useRemoteControlController() {
     const nextState = browserRemoteSession.current?.recordVideoElementSample(sample);
     if (nextState) setBrowserRemoteState(nextState);
   }, []);
+
+  // 切换被控端正在采集的屏幕。这是多显示器场景的正确做法：
+  // 服务端只编码被采集的那一块，切换本地 video 元素没有意义，必须让被控端改采集目标。
+  async function handleRemoteScreenSwitch(screenId: number) {
+    const session = browserRemoteSession.current;
+    if (!session) return;
+    if (screenId === browserRemoteState.currentScreenId) return;
+    if (controlChannelState !== "open") {
+      setError("控制通道未就绪，暂时无法切换屏幕");
+      return;
+    }
+    try {
+      session.sendSwitchScreen(screenId);
+      setBrowserRemoteState(session.getState());
+      showToast(`已切换到屏幕 ${screenId}`);
+    } catch (caught) {
+      setError(`切换屏幕失败：${caught instanceof Error ? caught.message : String(caught)}`);
+    }
+  }
+
+  // 让被控端补建一块虚拟屏。虚拟屏由被控端侧创建并纳入采集，
+  // 主控端只能通过建连参数(force_virtual_display / virtual_display_init_resolution)申请，
+  // 因此这里走重连路径，而不是发一条控制指令。
+  async function handleCreateVirtualScreen() {
+    await run("browser-remote-start", async () => {
+      resetBrowserRemoteSession();
+      if (!signalGatewayMatchesRoom) {
+        const status = await startRemoteSignalGateway({
+          gzipSdp: sdpTransportMode === "gzip",
+          signalServerIndex: signalServerIndex > 0 ? signalServerIndex : undefined,
+        });
+        setSignalGatewayStatus(status);
+        setSignalGatewayContext(status.status === "connected" ? roomJoinContext : null);
+        setRemoteSignalDiagnostics(await getRemoteSignalDiagnostics());
+        if (status.status !== "connected") {
+          throw new Error(formatSignalGatewayErrorHint(status) || "连接服务未启动");
+        }
+      }
+      await startBrowserRemoteSession({ skipReadinessCheck: true, forceVirtualDisplay: true });
+      showToast("已请求被控端创建虚拟屏");
+    });
+  }
 
   function handleRemoteClipboard(text: string) {
     // 反向剪贴板同步：被控端剪贴板变化时回传文本，写入本机剪贴板（失败则保留在面板供手动处理）。
@@ -1440,18 +1493,39 @@ export function useRemoteControlController() {
     return () => stage.removeEventListener("wheel", lockPageScroll);
   }, [inputControlActive]);
 
-  // 画面源信息：为每一路视频附上分辨率与是否有信号；hidden tile 的 videoWidth 依然是真实值，
-  // 因此即使某路当前未显示，也能据此标注“无信号”。未采样到（刚连上）时按有信号处理，避免误报。
-  const remoteVideoSources: RemoteVideoSourceInfo[] = remoteVideoStreams.map((video, index) => {
-    const sample = remoteVideoSamplesById[video.id];
-    const active = Boolean(sample) && (sample?.width ?? 0) > 0 && (sample?.height ?? 0) > 0;
-    return {
-      id: video.id,
-      index,
-      resolution: active ? `${sample?.width}×${sample?.height}` : "",
-      hasSignal: !sample || active,
-    };
-  });
+  // 画面源信息：优先用被控端上报的屏幕清单(物理屏 + 虚拟屏)驱动，
+  // 这样每张卡片对应一块真实显示器，可以直接切换被控端正在采集的屏幕。
+  // 只有清单还没到达时(刚连上)才退回按视频轨道编号展示，保证面板不空。
+  const remoteScreens = browserRemoteState.remoteScreens ?? [];
+  const currentScreenId = browserRemoteState.currentScreenId;
+  const remoteVideoSources: RemoteVideoSourceInfo[] =
+    remoteScreens.length > 0
+      ? remoteScreens.map((screen, index) => {
+          const resolution = screen.currentResolution ?? screen.initResolution ?? screen.resolutions[0];
+          return {
+            id: String(screen.id),
+            index,
+            resolution: resolution ? `${resolution.width}×${resolution.height}` : "",
+            hasSignal: true,
+            screenId: screen.id,
+            label: screen.displayName ?? "",
+            screenType: screen.screenType,
+            isCurrent: screen.id === currentScreenId,
+            isPrimary: screen.isPrimaryScreen,
+            fps: screen.fps,
+          };
+        })
+      : remoteVideoStreams.map((video, index) => {
+          const sample = remoteVideoSamplesById[video.id];
+          const active = Boolean(sample) && (sample?.width ?? 0) > 0 && (sample?.height ?? 0) > 0;
+          return {
+            id: video.id,
+            index,
+            resolution: active ? `${sample?.width}×${sample?.height}` : "",
+            hasSignal: !sample || active,
+            isCurrent: video.id === primaryRemoteVideoId,
+          };
+        });
   const primaryRemoteVideoSample = remoteVideoSamplesById[primaryRemoteVideoId];
   const primaryRemoteVideoActive =
     !primaryRemoteVideoSample || ((primaryRemoteVideoSample.width ?? 0) > 0 && (primaryRemoteVideoSample.height ?? 0) > 0);
@@ -1621,6 +1695,8 @@ export function useRemoteControlController() {
     onRemoteStageWheel: handleRemoteStageWheel,
     onRemoteShortcut: handleRemoteShortcut,
     onRemoteVideoSourceChange: setSelectedRemoteVideoId,
+    onRemoteScreenSwitch: (screenId: number) => void handleRemoteScreenSwitch(screenId),
+    onCreateVirtualScreen: () => void handleCreateVirtualScreen(),
     onRemoteVideoSample: handleRemoteVideoSample,
     onReadLocalClipboard: () => void handleReadLocalClipboard(),
     onReturnToDevices: () => void handleReturnToDevices(),

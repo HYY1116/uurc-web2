@@ -94,6 +94,13 @@ import {
   analyzeRemoteSignalReadiness,
   normalizeStreamerSignalControlAck,
   STREAMER_CONTROL_RESULT_ICE_SERVER_KEYS,
+  STREAMER_SCREEN_TYPES,
+  STREAMER_SCREEN_WIRE_FIELDS,
+  STREAMER_UPLINK_WIRE_FIELDS,
+  decodeStreamerScreenSources,
+  decodeStreamerScreenSourcesFromControlBytes,
+  encodeStreamerSwitchScreenMessage,
+  isVirtualStreamerScreen,
 } from "../src/streamerProtocol.js";
 
 describe("streamer protocol constants", () => {
@@ -1334,3 +1341,252 @@ describe("streamer connection path classification", () => {
     expect(classifyStreamerConnectionPath({})).toBe("unknown");
   });
 });
+describe("streamer multi-display and virtual screen protocol", () => {
+  it("pins the uplink and screen wire tags recovered from the App", () => {
+    expect(STREAMER_UPLINK_WIRE_FIELDS).toEqual({
+      seqTag: 1,
+      timestampTag: 2,
+      rpcRequestTag: 21,
+      screensTag: 7,
+      captureChangeTag: 8,
+    });
+    expect(STREAMER_SCREEN_WIRE_FIELDS).toEqual({
+      idTag: 1,
+      fpsTag: 2,
+      resolutionsTag: 3,
+      currentResolutionTag: 4,
+      screenTypeTag: 5,
+      initResolutionTag: 6,
+      isPrimaryScreenTag: 7,
+      dprTag: 8,
+      dpiScaleTag: 9,
+      displayNameTag: 10,
+      resolutionTypeTag: 11,
+      videoTrackIndexTag: 12,
+      builtinScreenTypeTag: 13,
+    });
+    expect(STREAMER_SCREEN_TYPES).toEqual({
+      ScreenType_Physics: 0,
+      ScreenType_Virtual: 1,
+      ScreenType_Super: 2,
+    });
+  });
+
+  it("encodes the capture_setting rpc that switches the captured screen", () => {
+    const bytes = encodeStreamerSwitchScreenMessage({
+      seq: 7,
+      timestampMs: 1700000000,
+      screenId: 3,
+      cursorCapture: true,
+      requestId: 1,
+    });
+
+    // L3{ seq=1, timestamp=2, rpc_request=21 } -> T5{ request_header=1, capture_setting=2 }
+    // -> CaptureSettingRequest{ cursor_capture=3, screen_id=4 }.
+    expect(Array.from(bytes)).toEqual([
+      0x08, 0x07,
+      0x10, 0x80, 0xe2, 0xcf, 0xaa, 0x06,
+      0xaa, 0x01, 0x0a,
+      0x0a, 0x02, 0x08, 0x01,
+      0x12, 0x04, 0x18, 0x01, 0x20, 0x03,
+    ]);
+  });
+
+  it("always emits screen_id so switching to screen 0 is not dropped", () => {
+    const bytes = encodeStreamerSwitchScreenMessage({ seq: 1, timestampMs: 1, screenId: 0 });
+    // tag 4 varint 0 must still be on the wire, otherwise the controlled side keeps the old screen.
+    expect(Array.from(bytes)).toContain(0x20);
+    const tail = Array.from(bytes).slice(-2);
+    expect(tail).toEqual([0x20, 0x00]);
+  });
+
+  it("decodes the screen list pushed by the controlled side", () => {
+    const decoded = decodeStreamerScreenSources([
+      {
+        data: {
+          current_screen_id: 1,
+          screens: [
+            {
+              id: 0,
+              fps: 60,
+              screen_type: STREAMER_SCREEN_TYPES.ScreenType_Physics,
+              is_primary_screen: true,
+              display_name: "DP-1",
+              current_resolution: { width: 2560, height: 1440, pixel_width: 2560, pixel_height: 1440 },
+            },
+            {
+              id: 1,
+              fps: 60,
+              screen_type: STREAMER_SCREEN_TYPES.ScreenType_Virtual,
+              display_name: "UU Virtual Display",
+              current_resolution: { width: 1920, height: 1080 },
+            },
+          ],
+        },
+      },
+    ]);
+
+    expect(decoded).not.toBeNull();
+    expect(decoded?.currentScreenId).toBe(1);
+    expect(decoded?.screens.map((screen) => screen.id)).toEqual([0, 1]);
+    expect(decoded?.screens.map((screen) => isVirtualStreamerScreen(screen))).toEqual([false, true]);
+    expect(decoded?.screens[0].currentResolution).toEqual({
+      left: 0,
+      top: 0,
+      width: 2560,
+      height: 1440,
+      pixelWidth: 2560,
+      pixelHeight: 1440,
+    });
+    expect(decoded?.screens[1].displayName).toBe("UU Virtual Display");
+  });
+
+  // 真机抓包回归:真实 payload 走 forward_setting.data.signal_app_data.binary_data.base64，
+  // 里面是 protobuf 而不是结构化 JSON；且主屏 id=0 / current_screen_id=0 都被 protobuf 省略。
+  it("decodes the real captured dual-monitor payload from signal_app_data", () => {
+    const decoded = decodeStreamerScreenSources([
+      {
+        client_id: "aecgooynpaacapv7",
+        data: {
+          type: "signal_app_data",
+          signal_app_data: {
+            ice_id: "3fd5077edeb04a0e8ef8c475db0a12d9",
+            binary_data: { kind: "binary", byteLength: 394, base64: REAL_CAPTURED_SCREEN_SOURCES_BASE64 },
+          },
+        },
+      },
+    ]);
+
+    expect(decoded).not.toBeNull();
+    expect(decoded?.screens).toHaveLength(2);
+    // 主屏 id=0 因为 protobuf 默认值被省略，仍必须解析成 0 而不是被丢弃。
+    expect(decoded?.screens.map((screen) => screen.id)).toEqual([0, 1]);
+    expect(decoded?.screens[0].displayName).toBe("H24T7");
+    expect(decoded?.screens[0].isPrimaryScreen).toBe(true);
+    expect(decoded?.screens[0].currentResolution?.width).toBe(2560);
+    expect(decoded?.screens[0].currentResolution?.height).toBe(1440);
+    expect(decoded?.screens[0].videoTrackIndex).toBeUndefined();
+    expect(decoded?.screens[0].fps).toBe(180);
+
+    expect(decoded?.screens[1].displayName).toBe("N50pro V");
+    expect(decoded?.screens[1].isPrimaryScreen).toBe(false);
+    expect(decoded?.screens[1].currentResolution?.width).toBe(1920);
+    // 第二块屏当前没有分配视频轨(0xFFFFFFFF)，这正是「显示器 2 无信号」的协议层证据。
+    expect(decoded?.screens[1].videoTrackIndex).toBeUndefined();
+    // 没有 current_screen_id 字段时回落到主屏。
+    expect(decoded?.currentScreenId).toBe(0);
+  });
+
+  it("normalizes a -1 video track index to undefined instead of a huge number", () => {
+    const frame = buildScreenSourcesFrameWithTrackIndex(0xffffffff);
+    const decoded = decodeStreamerScreenSourcesFromControlBytes(frame);
+    expect(decoded?.screens[0].videoTrackIndex).toBeUndefined();
+  });
+
+  it("falls back to the primary screen when the reported current id is not in the list", () => {
+    const decoded = decodeStreamerScreenSources([
+      {
+        data: {
+          current_screen_id: 99,
+          screens: [
+            { id: 4, screen_type: STREAMER_SCREEN_TYPES.ScreenType_Physics },
+            { id: 5, screen_type: STREAMER_SCREEN_TYPES.ScreenType_Physics, is_primary_screen: true },
+          ],
+        },
+      },
+    ]);
+
+    expect(decoded?.currentScreenId).toBe(5);
+  });
+
+  it("returns null for payloads without a screen list", () => {
+    expect(decodeStreamerScreenSources([{ data: { type: "answer", sdp: "v=0" } }])).toBeNull();
+    expect(decodeStreamerScreenSources(null)).toBeNull();
+  });
+
+  it("decodes the screen list from a binary control-channel frame", () => {
+    const frame = buildScreenSourcesFrame();
+    const decoded = decodeStreamerScreenSourcesFromControlBytes(frame);
+
+    expect(decoded?.currentScreenId).toBe(1);
+    expect(decoded?.screens).toHaveLength(2);
+    expect(decoded?.screens[0].displayName).toBe("DP-1");    expect(decoded?.screens[0].currentResolution?.width).toBe(1920);
+    expect(decoded?.screens[0].currentResolution?.pixelWidth).toBe(2560);
+    expect(decoded?.screens[1].screenType).toBe(STREAMER_SCREEN_TYPES.ScreenType_Virtual);
+    expect(decoded?.screens[1].videoTrackIndex).toBe(1);
+  });
+});
+
+// 手工拼一条 L3{ screens=7 } 字节帧，模拟被控端在控制通道里推送屏幕清单。
+function buildScreenSourcesFrame(): Uint8Array {
+  return new Uint8Array([
+    ...varintField(1, 42),
+    ...varintField(2, 1700000000),
+    ...lengthDelimited(7, [
+      // ScreenSources: screens 是 1 号(repeated)、current_screen_id 是 2 号。
+      ...lengthDelimited(1, [
+        ...varintField(1, 0),
+        ...varintField(2, 60),
+        ...lengthDelimited(4, [
+          ...varintField(1, 0),
+          ...varintField(2, 0),
+          ...varintField(3, 1920),
+          ...varintField(4, 1080),
+          ...varintField(5, 2560),
+          ...varintField(6, 1440),
+        ]),
+        ...varintField(5, 0),
+        ...varintField(7, 1),
+        ...lengthDelimited(10, Array.from(new TextEncoder().encode("DP-1"))),
+      ]),
+      ...lengthDelimited(1, [
+        ...varintField(1, 1),
+        ...varintField(2, 60),
+        ...lengthDelimited(4, [...varintField(3, 1920), ...varintField(4, 1080)]),
+        ...varintField(5, 1),
+        ...varintField(12, 1),
+        ...lengthDelimited(10, Array.from(new TextEncoder().encode("UU Virtual Display"))),
+      ]),
+      ...varintField(2, 1),
+    ]),
+  ]);
+}
+
+function varintField(tag: number, value: number): number[] {
+  return [...varintBytes((tag << 3) | 0), ...varintBytes(value)];
+}
+
+// 真机抓包(Windows 双显示器 H24T7 + N50pro V)的 signal_app_data.binary_data.base64 原文。
+// 保留原文而不是重建成结构化 JSON，是为了锁住「真实形状」不被后续重构悄悄改坏。
+const REAL_CAPTURED_SCREEN_SOURCES_BASE64 =
+  "CIwFEMOtu4CaNDr9AgrJARC0ARoGGIAUIKALGgYYgA8gsAkaBhiADyC4CBoGGOANIN4HGgYYkA0gmggaBhjADCCwCRoGGMAMIIQHGgYYoAsghAcaBhj4CiCaBhoGGNYKIIAGGgYYoAoggAgaBhiACiDABxoGGIAKIKAGGgYYoAog0AUaBhiACSDgBhoGGOgIIPoEGgYYgAgggAYaBhigBiDYBCIGGIAUIKALMgYYgBQgoAs4AUEAAAAAAAD0P0oQCH0QfRoKZH2WAa8ByAHhAVIFSDI0VDdYAwquAQgBELQBGgYYgA8guAgaBhjgDSDeBxoGGJANIJoIGgYYwAwghAcaBhigCyCEBxoGGNYKIIAGGgYYoAoggAgaBhiACiDABxoGGIAKIKAGGgYYoAog0AUaBhjoCCD6BBoGGIAIIIAGGgYYoAYg2AQiCQiAFBiADyC4CDIGGIAPILgIQQAAAAAAAPQ/SgwIZBBkGgZkfZYBrwFSCE41MHBybyBWWANg////////////AQ==";
+
+function buildScreenSourcesFrameWithTrackIndex(trackIndex: number): Uint8Array {
+  return new Uint8Array([
+    ...varintField(1, 1),
+    ...varintField(2, 42),
+    ...lengthDelimited(7, [
+      ...lengthDelimited(1, [
+        ...varintField(2, 60),
+        ...lengthDelimited(4, [...varintField(3, 1920), ...varintField(4, 1080)]),
+        ...varintField(12, trackIndex),
+      ]),
+    ]),
+  ]);
+}
+
+function varintBytes(value: number): number[] {
+  const bytes: number[] = [];
+  let remaining = value;
+  do {
+    let byte = remaining & 0x7f;
+    remaining = Math.floor(remaining / 128);
+    if (remaining !== 0) byte |= 0x80;
+    bytes.push(byte);
+  } while (remaining !== 0);
+  return bytes;
+}
+
+function lengthDelimited(tag: number, body: number[]): number[] {
+  return [...varintBytes((tag << 3) | 2), ...varintBytes(body.length), ...body];
+}

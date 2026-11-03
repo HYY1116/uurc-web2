@@ -127,6 +127,8 @@ export interface RemoteControlPageProps {
   onRemoteStageWheel: (event: WheelEvent<HTMLDivElement>) => void;
   onRemoteShortcut: (shortcut: RemoteShortcut) => void;
   onRemoteVideoSourceChange: (videoId: string) => void;
+  onRemoteScreenSwitch: (screenId: number) => void;
+  onCreateVirtualScreen: () => void;
   onRemoteVideoSample: (videoId: string, sample: BrowserRemoteVideoElementSample) => void;
   onReadLocalClipboard: () => void;
   onReturnToDevices: () => void;

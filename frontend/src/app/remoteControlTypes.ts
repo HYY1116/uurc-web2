@@ -47,7 +47,16 @@ export type RemoteVideoSourceInfo = {
   index: number;
   resolution: string;
   hasSignal: boolean;
+  // 被控端上报的屏幕标识。只有拿到真实屏幕清单时才有；纯视频轨回退场景下为 undefined。
+  screenId?: number;
+  label?: string;
+  screenType?: number;
+  isCurrent?: boolean;
+  isPrimary?: boolean;
+  fps?: number;
 };
+
+export type RemoteScreenSwitchState = "idle" | "switching" | "failed";
 
 export type RemoteConnectionQualityState = "pending" | "good" | "warn" | "bad";
 

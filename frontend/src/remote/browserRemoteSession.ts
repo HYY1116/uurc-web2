@@ -16,6 +16,9 @@ import {
   buildStreamerRtcConfiguration,
   classifyStreamerConnectionPath,
   decodeStreamerControlMessage,
+  decodeStreamerScreenSources,
+  decodeStreamerScreenSourcesFromControlBytes,
+  encodeStreamerSwitchScreenMessage,
   encodeStreamerEchoResponseMessage,
   encodeStreamerEchoRequestMessage,
   encodeStreamerInputMessage,
@@ -29,6 +32,8 @@ import {
   type StreamerDataChannelLabel,
   type StreamerIceNetworkType,
   type StreamerMouseButtonKind,
+  type StreamerScreenInfo,
+  type StreamerScreenSources,
   type StreamerSignalControlResult,
   type BuildStreamerGamepadInputMessageInput,
   toStreamerGamepadUpdateState,
@@ -238,6 +243,10 @@ export interface BrowserRemoteSessionState {
   remoteTrackCount: number;
   remoteDisplayId?: number;
   remoteInputDisplayId?: number;
+  // 被控端上报的完整屏幕清单(物理屏 + 虚拟屏 + 超级屏)。
+  // currentScreenId 是被控端当前真正在采集的那块,remoteDisplayId 是它归一化后的输入索引。
+  remoteScreens?: StreamerScreenInfo[];
+  currentScreenId?: number;
   selectedCandidatePair?: BrowserRemoteSelectedCandidatePair;
   stage: "idle" | "controlled" | "offered" | "connected";
   videoElement?: BrowserRemoteVideoElementSample;
@@ -276,6 +285,9 @@ export class BrowserRemoteSession {
   private remoteStream: MediaStream | null = null;
   private remoteDisplayId: number | undefined;
   private remoteInputDisplayId: number | undefined;
+  private remoteScreens: StreamerScreenInfo[] | undefined;
+  private currentScreenId: number | undefined;
+  private screenSwitchRequestId = 1;
   private sequence = 1;
   private readonly heldKeyboardValues = new Set<string | number>();
   private readonly heldMouseButtons = new Set<StreamerMouseButtonKind | number>();
@@ -316,6 +328,7 @@ export class BrowserRemoteSession {
       dataChannels: { ...this.state.dataChannels },
       debugEvents: [...this.debugEvents],
       inboundVideo: this.state.inboundVideo ? { ...this.state.inboundVideo } : undefined,
+      remoteScreens: this.getRemoteScreens(),
       selectedCandidatePair: this.state.selectedCandidatePair ? { ...this.state.selectedCandidatePair } : undefined,
       videoElement: this.state.videoElement ? { ...this.state.videoElement } : undefined,
       videoFlow: this.state.videoFlow
@@ -356,6 +369,9 @@ export class BrowserRemoteSession {
     this.remoteStream = null;
     this.remoteDisplayId = undefined;
     this.remoteInputDisplayId = undefined;
+    this.remoteScreens = undefined;
+    this.currentScreenId = undefined;
+    this.screenSwitchRequestId = 1;
     this.sequence = 1;
     this.heldKeyboardValues.clear();
     this.heldMouseButtons.clear();
@@ -537,6 +553,46 @@ export class BrowserRemoteSession {
     this.sendInputData(buildStreamerTextInputMessage(content));
   }
 
+  // 切换被控端正在采集的屏幕。这是多显示器/虚拟屏的核心动作：
+  // 官方主控端通过 rpc_request 下发 CaptureSetting(screen_id)，被控端随后重推一路新的视频。
+  // 注意不能用「切换本地 video 元素」的方式模拟——服务端只会编码被抓取的那一块屏。
+  sendSwitchScreen(screenId: number, options: { fps?: number } = {}): void {
+    if (!Number.isFinite(screenId) || screenId < 0) {
+      this.recordDebugEvent("data_send", "跳过非法的屏幕切换请求", { screenId });
+      return;
+    }
+    const sequence = this.sequence;
+    const timestampSeconds = this.streamerTimestampSeconds();
+    const payload = encodeStreamerSwitchScreenMessage({
+      seq: sequence,
+      timestampMs: timestampSeconds,
+      screenId,
+      fps: options.fps,
+      cursorCapture: true,
+      requestId: this.screenSwitchRequestId,
+    });
+    this.sequence += 1;
+    this.screenSwitchRequestId += 1;
+    this.sendDataChannel(STREAMER_DATA_CHANNEL_LABELS.control, payload, {
+      summary: "请求切换采集屏幕",
+      details: {
+        sequence,
+        timestampSeconds,
+        screenId,
+        previousScreenId: this.currentScreenId,
+        fps: options.fps,
+        route: "rpc_request/capture_setting",
+      },
+    });
+    // 本地立刻登记目标屏,使此后的键鼠输入带上正确的 displayId,
+    // 不必等被控端回推 RecvScreenSources(那段窗口期内输入会打到旧屏)。
+    this.applyActiveScreenId(screenId);
+  }
+
+  getRemoteScreens(): StreamerScreenInfo[] {
+    return this.remoteScreens ? this.remoteScreens.map((screen) => ({ ...screen })) : [];
+  }
+
   releaseAllInputs(): void {
     // 兜底：把当前“按住”的鼠标键与键盘键全部抬起。避免失焦 / 右键菜单 / 系统快捷键吞掉
     // pointerup/keyup 后，在被控端留下卡住的按键（右键卡死、Alt 卡死等）。
@@ -695,6 +751,11 @@ export class BrowserRemoteSession {
       }
       if (event.event === "forward_setting" || event.event === "device_capability") {
         this.applyRemoteDisplayCapability(event);
+        this.processedSignalEventIds.add(event.id);
+        continue;
+      }
+      // 屏幕清单也可能随 streamer_push 下发(被控端插拔显示器、新建虚拟屏时会主动推)。
+      if (event.event === "streamer_push" && this.applyRemoteDisplayCapability(event)) {
         this.processedSignalEventIds.add(event.id);
       }
     }
@@ -989,6 +1050,11 @@ export class BrowserRemoteSession {
   }
 
   private recordDataChannelMessage(label: StreamerDataChannelLabel, data: unknown): void {
+    const payloadBytes = label === STREAMER_DATA_CHANNEL_LABELS.control ? dataChannelPayloadBytes(data) : undefined;
+    if (label === STREAMER_DATA_CHANNEL_LABELS.control && payloadBytes) {
+      // 屏幕清单可能只走控制通道的 screens 字段,与信号通道的推送互为补充。
+      this.applyControlScreenSources(payloadBytes);
+    }
     const decodedControlMessage =
       label === STREAMER_DATA_CHANNEL_LABELS.control ? this.decodeControlDataChannelMessage(data) : undefined;
     if (decodedControlMessage) this.handleControlDataMessage(decodedControlMessage);
@@ -1061,6 +1127,13 @@ export class BrowserRemoteSession {
       inputDisplayId: nextInputDisplayId,
       captureChange,
     });
+  }
+
+  private applyControlScreenSources(bytes: Uint8Array): void {
+    // 屏幕清单也可能作为 screens(tag 7)出现在控制数据通道的二进制帧里。
+    // 与信号通道的 JSON 载荷共用同一份解析结果,避免两套格式各说各话。
+    const sources = decodeStreamerScreenSourcesFromControlBytes(bytes);
+    if (sources) this.applyScreenSources(sources);
   }
 
   private sendEchoResponse(responseSequence: number): void {
@@ -1247,15 +1320,93 @@ export class BrowserRemoteSession {
     // 真正影响 UI 的状态变化都会经由 setState 单独推送；调试列表会在下一次 setState 或 1.5s 轮询时刷新。
   }
 
-  private applyRemoteDisplayCapability(event: RemoteSignalGatewayEvent): void {
+  private applyRemoteDisplayCapability(event: RemoteSignalGatewayEvent): boolean {
+    // 优先解析完整的 screens 清单:多显示器和虚拟屏只能从这里拿到,
+    // display_info 只给"第一块屏"的粗粒度能力(id/fps/type/hdr),信息量不足以驱动切换。
+    const sources = decodeStreamerScreenSources(event.payload);
+    if (sources) {
+      this.applyScreenSources(sources);
+      return true;
+    }
+
     const displayId = extractRemoteDisplayId(event.payload);
-    if (displayId === undefined || displayId === this.remoteDisplayId) return;
-    this.remoteDisplayId = displayId;
+    if (displayId === undefined) return false;
+    if (displayId !== this.remoteDisplayId) {
+      this.remoteDisplayId = displayId;
+      this.setState({
+        ...this.state,
+        remoteDisplayId: displayId,
+      });
+      this.recordDebugEvent("signal", "记录受控端显示器", { displayId });
+    }
+    return true;
+  }
+
+  private applyScreenSources(sources: StreamerScreenSources): void {
+    const previousSignature = this.buildScreenSignature();
+    this.remoteScreens = sources.screens;
+    this.currentScreenId = sources.currentScreenId;
+    this.remoteDisplayId = sources.currentScreenId;
+    // 输入索引同步到新屏,否则键鼠仍会打到切换前的显示器。
+    this.remoteInputDisplayId = sources.currentScreenId;
+
+    const signature = this.buildScreenSignature();
+    // 信号事件会周期性重复推送同一份清单;只有内容变化时才推 React 状态,避免无谓重渲染。
+    const changed = signature !== previousSignature;
+    if (changed) {
+      this.setState({
+        ...this.state,
+        currentScreenId: sources.currentScreenId,
+        remoteDisplayId: sources.currentScreenId,
+        remoteInputDisplayId: sources.currentScreenId,
+        remoteScreens: this.getRemoteScreens(),
+      });
+      this.recordDebugEvent("signal", "更新受控端屏幕清单", {
+        currentScreenId: sources.currentScreenId,
+        screenCount: sources.screens.length,
+        screens: sources.screens.map((screen) => ({
+          id: screen.id,
+          screenType: screen.screenType,
+          primary: screen.isPrimaryScreen,
+          displayName: screen.displayName,
+          fps: screen.fps,
+          resolution: screen.currentResolution
+            ? `${screen.currentResolution.width}x${screen.currentResolution.height}`
+            : undefined,
+        })),
+      });
+    }
+  }
+
+  private buildScreenSignature(): string {
+    const screens = this.remoteScreens ?? [];
+    return [
+      `cur=${this.currentScreenId ?? ""}`,
+      ...screens.map((screen) => {
+        const resolution = screen.currentResolution;
+        return [
+          screen.id,
+          screen.screenType,
+          screen.isPrimaryScreen ? 1 : 0,
+          screen.fps,
+          screen.displayName ?? "",
+          resolution ? `${resolution.width}x${resolution.height}` : "",
+        ].join(":");
+      }),
+    ].join("|");
+  }
+
+  private applyActiveScreenId(screenId: number): void {
+    if (screenId === this.currentScreenId && screenId === this.remoteInputDisplayId) return;
+    this.currentScreenId = screenId;
+    this.remoteDisplayId = screenId;
+    this.remoteInputDisplayId = screenId;
     this.setState({
       ...this.state,
-      remoteDisplayId: displayId,
+      currentScreenId: screenId,
+      remoteDisplayId: screenId,
+      remoteInputDisplayId: screenId,
     });
-    this.recordDebugEvent("signal", "记录受控端显示器", { displayId });
   }
 }
 

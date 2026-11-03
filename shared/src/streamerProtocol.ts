@@ -685,6 +685,516 @@ export const STREAMER_SIMPLE_ACTION_WIRE_FIELDS = {
   featureFlagTag: 4,
 } as const;
 
+// 屏幕源(screens)与屏幕切换(capture_setting)的线上字段。
+// 来源:官方安卓主控端 4.45.0 的 proto(L3 聚合报文 + Screen + ScreenSources + CaptureSettingRequest)。
+// 多显示器与虚拟屏的全部能力都挂在这两条链路上:
+//   - 被控端 -> 主控端:RecvScreenSources { current_screen_id=1, screens=2 } 周期性推送整张屏幕清单;
+//   - 主控端 -> 被控端:CaptureSetting(screen_id) 走 rpc_request 请求切换正在采集的屏幕。
+export const STREAMER_UPLINK_WIRE_FIELDS = {
+  seqTag: 1,
+  timestampTag: 2,
+  rpcRequestTag: 21,
+  screensTag: 7,
+  captureChangeTag: 8,
+} as const;
+
+export const STREAMER_CAPTURE_SETTING_REQUEST_WIRE_FIELDS = {
+  screenSourcesTag: 1,
+  currentScreenIdTag: 2,
+  screensTag: 2,
+  screenIdTag: 1,
+  fpsTag: 2,
+  resolutionsTag: 3,
+  currentResolutionTag: 4,
+  screenTypeTag: 5,
+  initResolutionTag: 6,
+} as const;
+
+// ScreenSources{ screens=1(repeated Screen), current_screen_id=2 }。
+// 注意:这里的 screens 是 1 号,screen_id 是 2 号——与 Screen 内部的 id=1 不是一回事。
+// 该结论来自真机 signal_app_data 抓包反解,不是从 Kotlin 字段名推断的:
+// 实测 payload 的 tag 7(ScreenSources) 下只有重复的 tag 1(Screen),没有 tag 2
+// (主屏的 current_screen_id 取默认值 0 被 protobuf 省略)。
+export const STREAMER_SCREEN_SOURCE_WIRE_FIELDS = {
+  screensTag: 1,
+  currentScreenIdTag: 2,
+} as const;
+
+export const STREAMER_SCREEN_WIRE_FIELDS = {
+  idTag: 1,
+  fpsTag: 2,
+  resolutionsTag: 3,
+  currentResolutionTag: 4,
+  screenTypeTag: 5,
+  initResolutionTag: 6,
+  isPrimaryScreenTag: 7,
+  dprTag: 8,
+  dpiScaleTag: 9,
+  displayNameTag: 10,
+  resolutionTypeTag: 11,
+  videoTrackIndexTag: 12,
+  builtinScreenTypeTag: 13,
+} as const;
+
+export const STREAMER_SCREEN_RESOLUTION_WIRE_FIELDS = {
+  leftTag: 1,
+  topTag: 2,
+  widthTag: 3,
+  heightTag: 4,
+  pixelWidthTag: 5,
+  pixelHeightTag: 6,
+} as const;
+
+export const STREAMER_RPC_WIRE_FIELDS = {
+  requestHeaderTag: 1,
+  captureSettingTag: 2,
+} as const;
+
+export const STREAMER_RPC_REQUEST_HEADER_WIRE_FIELDS = {
+  requestIdTag: 1,
+} as const;
+
+export const STREAMER_CAPTURE_SETTING_REQUEST_FIELDS = [
+  { tag: 1, name: "fps", defaultValue: "FPS_UNKNOWN" },
+  { tag: 2, name: "frame_quality", defaultValue: "VideoQuality_UNKNOWN" },
+  { tag: 3, name: "cursor_capture", defaultValue: false },
+  { tag: 4, name: "screen_id", defaultValue: 0 },
+  { tag: 5, name: "resolution_width", defaultValue: 0 },
+  { tag: 6, name: "resolution_height", defaultValue: 0 },
+  { tag: 7, name: "chorma_format", defaultValue: "ChromaFormat_UNKNOWN" },
+  { tag: 8, name: "max_custom_bitrate", defaultValue: 0 },
+  { tag: 9, name: "dpi_scale", defaultValue: 0 },
+  { tag: 10, name: "resolution_type", defaultValue: "ChooseType_UNKNOWN" },
+  { tag: 11, name: "enable_hdr", defaultValue: false },
+  { tag: 12, name: "auto_frame_quality", defaultValue: "VideoQuality_UNKNOWN" },
+  { tag: 13, name: "codec_type", defaultValue: "CodecType_UNKNOWN" },
+  { tag: 14, name: "max_scale_width", defaultValue: 0 },
+  { tag: 15, name: "max_scale_height", defaultValue: 0 },
+  { tag: 16, name: "resolution_pixel_width", defaultValue: 0 },
+  { tag: 17, name: "resolution_pixel_height", defaultValue: 0 },
+  { tag: 18, name: "fpsCount", defaultValue: 0 },
+] as const;
+
+// 被控端上报的屏幕类型:物理屏 / 虚拟屏 / 超级屏(拼接)。
+export const STREAMER_SCREEN_TYPES = {
+  ScreenType_Physics: 0,
+  ScreenType_Virtual: 1,
+  ScreenType_Super: 2,
+} as const;
+
+export type StreamerScreenType = (typeof STREAMER_SCREEN_TYPES)[keyof typeof STREAMER_SCREEN_TYPES];
+
+export const STREAMER_BUILTIN_SCREEN_TYPES = {
+  BS_UNKOWN: 0,
+  BS_BUILTIN: 1,
+  BS_NOT_BUILTIN: 2,
+} as const;
+
+export interface StreamerScreenResolution {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  pixelWidth: number;
+  pixelHeight: number;
+}
+
+export interface StreamerScreenInfo {
+  id: number;
+  fps: number;
+  resolutions: StreamerScreenResolution[];
+  currentResolution?: StreamerScreenResolution;
+  screenType: StreamerScreenType;
+  initResolution?: StreamerScreenResolution;
+  isPrimaryScreen: boolean;
+  dpr?: number;
+  dpiScale?: number;
+  displayName?: string;
+  resolutionType?: number;
+  videoTrackIndex?: number;
+  builtinScreenType?: number;
+}
+
+export interface StreamerScreenSources {
+  currentScreenId: number;
+  screens: StreamerScreenInfo[];
+}
+
+export interface EncodeStreamerSwitchScreenInput {
+  seq: number | bigint;
+  timestampMs: number | bigint;
+  screenId: number;
+  fps?: number;
+  frameQuality?: number;
+  cursorCapture?: boolean;
+  resolutionType?: number;
+  resolution?: StreamerScreenResolutionInput | null;
+  dpiScale?: number;
+  customBitrate?: number;
+  videoCodec?: number;
+  maxScaleWidth?: number;
+  maxScaleHeight?: number;
+  requestId?: number | bigint;
+}
+
+const STREAMER_CAPTURE_SETTING_DISABLED_RESOLUTION_TYPE = 0;
+
+export function encodeStreamerSwitchScreenMessage(input: EncodeStreamerSwitchScreenInput): Uint8Array {
+  const captureSettingBytes: number[] = [];
+  const fps = input.fps ?? STREAMER_FPS_VALUES.FPS_UNKNOWN;
+  if (fps !== STREAMER_FPS_VALUES.FPS_UNKNOWN) pushVarintField(captureSettingBytes, 1, fps);
+  const frameQuality = input.frameQuality ?? STREAMER_VIDEO_QUALITY_VALUES.VideoQuality_UNKNOWN;
+  if (frameQuality !== STREAMER_VIDEO_QUALITY_VALUES.VideoQuality_UNKNOWN) {
+    pushVarintField(captureSettingBytes, 2, frameQuality);
+  }
+  if (input.cursorCapture) pushVarintField(captureSettingBytes, 3, 1);
+  // screen_id 是切换屏幕的唯一开关;即使为 0 也必须显式下发,否则被控端沿用上次采集的屏幕。
+  pushVarintField(captureSettingBytes, 4, input.screenId);
+  if (input.resolution) {
+    pushVarintField(captureSettingBytes, 5, input.resolution.width);
+    pushVarintField(captureSettingBytes, 6, input.resolution.height);
+  }
+  if (input.dpiScale) pushInt32Field(captureSettingBytes, 9, input.dpiScale);
+  const resolutionType = input.resolutionType ?? STREAMER_CAPTURE_SETTING_DISABLED_RESOLUTION_TYPE;
+  if (resolutionType !== STREAMER_CAPTURE_SETTING_DISABLED_RESOLUTION_TYPE) {
+    pushVarintField(captureSettingBytes, 10, resolutionType);
+  }
+  if (input.customBitrate) pushInt32Field(captureSettingBytes, 8, input.customBitrate);
+  if (input.videoCodec && input.videoCodec !== STREAMER_VIDEO_CODECS.Unknown) {
+    pushVarintField(captureSettingBytes, 13, input.videoCodec);
+  }
+  if (input.maxScaleWidth) pushInt32Field(captureSettingBytes, 14, input.maxScaleWidth);
+  if (input.maxScaleHeight) pushInt32Field(captureSettingBytes, 15, input.maxScaleHeight);
+
+  const rpcBytes: number[] = [];
+  const requestId = input.requestId;
+  if (requestId !== undefined) {
+    const headerBytes: number[] = [];
+    pushVarintField(headerBytes, STREAMER_RPC_REQUEST_HEADER_WIRE_FIELDS.requestIdTag, requestId);
+    pushMessageField(rpcBytes, STREAMER_RPC_WIRE_FIELDS.requestHeaderTag, new Uint8Array(headerBytes));
+  }
+  pushMessageField(rpcBytes, STREAMER_RPC_WIRE_FIELDS.captureSettingTag, new Uint8Array(captureSettingBytes));
+
+  const envelopeBytes: number[] = [];
+  pushVarintField(envelopeBytes, STREAMER_UPLINK_WIRE_FIELDS.seqTag, input.seq);
+  pushVarintField(envelopeBytes, STREAMER_UPLINK_WIRE_FIELDS.timestampTag, input.timestampMs);
+  pushMessageField(envelopeBytes, STREAMER_UPLINK_WIRE_FIELDS.rpcRequestTag, new Uint8Array(rpcBytes));
+  return new Uint8Array(envelopeBytes);
+}
+
+export function decodeStreamerScreenSources(payload: unknown): StreamerScreenSources | null {
+  const payloads = Array.isArray(payload) ? payload : [payload];
+  for (const item of payloads) {
+    const record = asRecord(item);
+    if (!record) continue;
+    const data = asRecord(record.data) ?? record;
+
+    // 真实链路:屏幕清单藏在 forward_setting.data.signal_app_data.binary_data.base64 里,
+    // 是一段 L3 风格的 protobuf(screens 在 7 号字段),不是结构化 JSON。
+    const binarySources = decodeStreamerScreenSourcesFromSignalAppData(data);
+    if (binarySources) return binarySources;
+
+    // 兼容结构化的 screens JSON(便于测试与将来服务端直出)。
+    const screensValue = data.screens;
+    if (!Array.isArray(screensValue)) continue;
+    const screens = screensValue
+      .map(normalizeStreamerScreenInfo)
+      .filter((screen): screen is StreamerScreenInfo => screen !== null);
+    if (screens.length === 0) continue;
+    return {
+      currentScreenId: resolveCurrentScreenId(data.current_screen_id, screens),
+      screens,
+    };
+  }
+  return null;
+}
+
+function decodeStreamerScreenSourcesFromSignalAppData(
+  data: Record<string, unknown>,
+): StreamerScreenSources | null {
+  const appData = asRecord(data.signal_app_data);
+  if (!appData) return null;
+  const bytes = decodeBase64ToBytes(readBase64Payload(appData.binary_data));
+  return bytes ? decodeStreamerScreenSourcesFromControlBytes(bytes) : null;
+}
+
+function readBase64Payload(value: unknown): string | undefined {
+  if (typeof value === "string" && value.length > 0) return value;
+  const record = asRecord(value);
+  const base64 = record?.base64;
+  return typeof base64 === "string" && base64.length > 0 ? base64 : undefined;
+}
+
+function decodeBase64ToBytes(value: string | undefined): Uint8Array | null {
+  if (!value) return null;
+  try {
+    const binary = atob(value);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    return bytes;
+  } catch {
+    return null;
+  }
+}
+
+function resolveCurrentScreenId(value: unknown, screens: readonly StreamerScreenInfo[]): number {
+  const parsed = numberOrUndefined(value);
+  if (parsed !== undefined && screens.some((screen) => screen.id === parsed)) return parsed;
+  const primary = screens.find((screen) => screen.isPrimaryScreen);
+  return primary?.id ?? screens[0].id;
+}
+
+function normalizeStreamerScreenInfo(value: unknown): StreamerScreenInfo | null {
+  const record = asRecord(value);
+  if (!record) return null;
+  const id = numberOrUndefined(record.id);
+  if (id === undefined) return null;
+
+  const resolutionsValue = Array.isArray(record.resolutions) ? record.resolutions : [];
+  const screen: StreamerScreenInfo = {
+    id,
+    fps: numberOrUndefined(record.fps) ?? 0,
+    resolutions: resolutionsValue
+      .map(normalizeStreamerScreenResolution)
+      .filter((resolution): resolution is StreamerScreenResolution => resolution !== null),
+    screenType: normalizeScreenType(record.screen_type),
+    isPrimaryScreen: record.is_primary_screen === true,
+  };
+
+  const currentResolution = normalizeStreamerScreenResolution(record.current_resolution);
+  if (currentResolution) screen.currentResolution = currentResolution;
+  const initResolution = normalizeStreamerScreenResolution(record.init_resolution);
+  if (initResolution) screen.initResolution = initResolution;
+
+  assignOptionalNumber(screen, "dpr", record.dpr);
+  assignOptionalNumber(screen, "dpiScale", record.dpi_scale);
+  assignOptionalNumber(screen, "resolutionType", record.resolution_type);
+  assignOptionalNumber(screen, "videoTrackIndex", record.video_track_index);
+  assignOptionalNumber(screen, "builtinScreenType", record.builtin_screen_type);
+  if (typeof record.display_name === "string" && record.display_name.length > 0) {
+    screen.displayName = record.display_name;
+  }
+  return screen;
+}
+
+function normalizeStreamerScreenResolution(value: unknown): StreamerScreenResolution | null {
+  const record = asRecord(value);
+  if (!record) return null;
+  const resolution: StreamerScreenResolution = {
+    left: numberOrUndefined(record.left) ?? 0,
+    top: numberOrUndefined(record.top) ?? 0,
+    width: numberOrUndefined(record.width) ?? 0,
+    height: numberOrUndefined(record.height) ?? 0,
+    pixelWidth: numberOrUndefined(record.pixel_width) ?? 0,
+    pixelHeight: numberOrUndefined(record.pixel_height) ?? 0,
+  };
+  if (resolution.width <= 0 || resolution.height <= 0) return null;
+  return resolution;
+}
+
+function normalizeScreenType(value: unknown): StreamerScreenType {
+  return value === STREAMER_SCREEN_TYPES.ScreenType_Virtual || value === STREAMER_SCREEN_TYPES.ScreenType_Super
+    ? value
+    : STREAMER_SCREEN_TYPES.ScreenType_Physics;
+}
+
+function numberOrUndefined(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+export function isVirtualStreamerScreen(screen: StreamerScreenInfo): boolean {
+  return screen.screenType === STREAMER_SCREEN_TYPES.ScreenType_Virtual;
+}
+
+// 从控制通道的二进制上行报文里还原 screens(tag 7) 子消息。
+// 与 decodeStreamerScreenSources 的区别:那个吃 JSON 形态的信号事件载荷,
+// 这个吃 L3 protobuf 字节帧,两条链路都可能承载同一份屏幕清单。
+export function decodeStreamerScreenSourcesFromControlBytes(
+  data: ArrayBuffer | ArrayBufferView,
+): StreamerScreenSources | null {
+  const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  let topLevel: ProtobufField[];
+  try {
+    topLevel = readProtobufFields(bytes);
+  } catch {
+    return null;
+  }
+
+  const screensField = topLevel.find(
+    (field) => field.tag === STREAMER_UPLINK_WIRE_FIELDS.screensTag && field.bytes !== undefined,
+  );
+  if (!screensField?.bytes) return null;
+
+  const fields = readProtobufFields(screensField.bytes);
+  const screens: StreamerScreenInfo[] = [];
+  let currentScreenId: number | undefined;
+
+  for (const field of fields) {
+    if (field.tag === STREAMER_SCREEN_SOURCE_WIRE_FIELDS.currentScreenIdTag && field.varint !== undefined) {
+      currentScreenId = safeNumber(field.varint);
+      continue;
+    }
+    if (field.tag === STREAMER_SCREEN_SOURCE_WIRE_FIELDS.screensTag && field.bytes) {
+      const screen = decodeStreamerScreenFromBytes(field.bytes);
+      if (screen) screens.push(screen);
+    }
+  }
+
+  if (screens.length === 0) return null;
+  return {
+    currentScreenId: resolveCurrentScreenId(currentScreenId, screens),
+    screens,
+  };
+}
+
+function decodeStreamerScreenFromBytes(bytes: Uint8Array): StreamerScreenInfo | null {
+  const fields = readProtobufFields(bytes);
+  const resolutions: StreamerScreenResolution[] = [];
+  // 主屏的 id 是 0，protobuf 会把默认值省略，所以「没有 id 字段」= 屏幕 0，不能当成缺失。
+  let id = 0;
+  let fps = 0;
+  let screenType: StreamerScreenType = STREAMER_SCREEN_TYPES.ScreenType_Physics;
+  let currentResolution: StreamerScreenResolution | undefined;
+  let initResolution: StreamerScreenResolution | undefined;
+  let isPrimaryScreen = false;
+  let dpr: number | undefined;
+  let dpiScale: number | undefined;
+  let displayName: string | undefined;
+  let resolutionType: number | undefined;
+  let videoTrackIndex: number | undefined;
+  let builtinScreenType: number | undefined;
+
+  for (const field of fields) {
+    switch (field.tag) {
+      case STREAMER_SCREEN_WIRE_FIELDS.idTag:
+        if (field.varint !== undefined) id = safeNumber(field.varint) ?? 0;
+        break;
+      case STREAMER_SCREEN_WIRE_FIELDS.fpsTag:
+        if (field.varint !== undefined) fps = safeNumber(field.varint) ?? 0;
+        break;
+      case STREAMER_SCREEN_WIRE_FIELDS.resolutionsTag: {
+        const resolution = field.bytes ? decodeStreamerScreenResolutionFromBytes(field.bytes) : null;
+        if (resolution) resolutions.push(resolution);
+        break;
+      }
+      case STREAMER_SCREEN_WIRE_FIELDS.currentResolutionTag:
+        if (field.bytes) currentResolution = decodeStreamerScreenResolutionFromBytes(field.bytes) ?? undefined;
+        break;
+      case STREAMER_SCREEN_WIRE_FIELDS.screenTypeTag:
+        if (field.varint !== undefined) screenType = normalizeScreenType(safeNumber(field.varint));
+        break;
+      case STREAMER_SCREEN_WIRE_FIELDS.initResolutionTag:
+        if (field.bytes) initResolution = decodeStreamerScreenResolutionFromBytes(field.bytes) ?? undefined;
+        break;
+      case STREAMER_SCREEN_WIRE_FIELDS.isPrimaryScreenTag:
+        if (field.varint !== undefined) isPrimaryScreen = field.varint !== 0n;
+        break;
+      case STREAMER_SCREEN_WIRE_FIELDS.dprTag:
+        // dpr 是 double(fixed64)，例如 1.25。
+        if (field.bytes) dpr = readFixed64Double(field.bytes);
+        break;
+      case STREAMER_SCREEN_WIRE_FIELDS.dpiScaleTag:
+        // dpi_scale 是 {scaleX, scaleY} 消息，取其 scaleX 作为代表值。
+        if (field.bytes) dpiScale = readDpiScaleValue(field.bytes);
+        break;
+      case STREAMER_SCREEN_WIRE_FIELDS.displayNameTag:
+        if (field.bytes) displayName = textDecoder.decode(field.bytes);
+        break;
+      case STREAMER_SCREEN_WIRE_FIELDS.resolutionTypeTag:
+        if (field.varint !== undefined) resolutionType = safeNumber(field.varint);
+        break;
+      case STREAMER_SCREEN_WIRE_FIELDS.videoTrackIndexTag:
+        // uint32 -1 = 0xFFFFFFFF 表示「这块屏当前没有分配视频轨」。
+        if (field.varint !== undefined) videoTrackIndex = normalizeVideoTrackIndex(field.varint);
+        break;
+      case STREAMER_SCREEN_WIRE_FIELDS.builtinScreenTypeTag:
+        if (field.varint !== undefined) builtinScreenType = safeNumber(field.varint);
+        break;
+      default:
+        break;
+    }
+  }
+
+  const screen: StreamerScreenInfo = { id, fps, resolutions, screenType, isPrimaryScreen };
+  if (currentResolution) screen.currentResolution = currentResolution;
+  if (initResolution) screen.initResolution = initResolution;
+  if (dpr !== undefined) screen.dpr = dpr;
+  if (dpiScale !== undefined) screen.dpiScale = dpiScale;
+  if (displayName) screen.displayName = displayName;
+  if (resolutionType !== undefined) screen.resolutionType = resolutionType;
+  if (videoTrackIndex !== undefined) screen.videoTrackIndex = videoTrackIndex;
+  if (builtinScreenType !== undefined) screen.builtinScreenType = builtinScreenType;
+  return screen;
+}
+
+// 被控端用 0xFFFFFFFF(-1) 表示这块屏没有对应的视频轨(常见于未被采集的第二块屏)。
+// 归一化成 undefined，让上层能明确区分「0 号轨」和「没有轨」。
+function normalizeVideoTrackIndex(value: bigint): number | undefined {
+  if (value === 0xffffffffn || value === 0xffffffffffffffffn) return undefined;
+  const parsed = safeNumber(value);
+  return parsed !== undefined && parsed >= 0 ? parsed : undefined;
+}
+
+function readFixed64Double(bytes: Uint8Array): number | undefined {
+  if (bytes.byteLength < 8) return undefined;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, 8);
+  const value = view.getFloat64(0, true);
+  return Number.isFinite(value) ? value : undefined;
+}
+
+function readDpiScaleValue(bytes: Uint8Array): number | undefined {
+  const fields = readProtobufFields(bytes);
+  // 实测结构: { 1: scaleX, 2: scaleY, 3: ... }，两个值通常相同(125/125、100/100)。
+  const scaleX = fields.find((field) => field.tag === 1 && field.varint !== undefined);
+  if (scaleX?.varint !== undefined) return safeNumber(scaleX.varint);
+  const scaleY = fields.find((field) => field.tag === 2 && field.varint !== undefined);
+  return scaleY?.varint === undefined ? undefined : safeNumber(scaleY.varint);
+}
+
+function decodeStreamerScreenResolutionFromBytes(bytes: Uint8Array): StreamerScreenResolution | null {
+  const fields = readProtobufFields(bytes);
+  const resolution: StreamerScreenResolution = {
+    left: 0,
+    top: 0,
+    width: 0,
+    height: 0,
+    pixelWidth: 0,
+    pixelHeight: 0,
+  };
+
+  for (const field of fields) {
+    if (field.varint === undefined) continue;
+    const value = safeNumber(field.varint);
+    if (value === undefined) continue;
+    switch (field.tag) {
+      case STREAMER_SCREEN_RESOLUTION_WIRE_FIELDS.leftTag:
+        resolution.left = value;
+        break;
+      case STREAMER_SCREEN_RESOLUTION_WIRE_FIELDS.topTag:
+        resolution.top = value;
+        break;
+      case STREAMER_SCREEN_RESOLUTION_WIRE_FIELDS.widthTag:
+        resolution.width = value;
+        break;
+      case STREAMER_SCREEN_RESOLUTION_WIRE_FIELDS.heightTag:
+        resolution.height = value;
+        break;
+      case STREAMER_SCREEN_RESOLUTION_WIRE_FIELDS.pixelWidthTag:
+        resolution.pixelWidth = value;
+        break;
+      case STREAMER_SCREEN_RESOLUTION_WIRE_FIELDS.pixelHeightTag:
+        resolution.pixelHeight = value;
+        break;
+      default:
+        break;
+    }
+  }
+
+  return resolution.width > 0 && resolution.height > 0 ? resolution : null;
+}
+
 export const STREAMER_SIMPLE_ACTION_TYPES = {
   ACTION_TYPE_ECHO_REQUEST: 0,
   ACTION_TYPE_ECHO_RESPONSE: 1,
@@ -857,11 +1367,17 @@ export interface BuildDefaultStreamerConnectOptionsBase64Input {
   cursorCapture?: boolean;
   localResolution?: StreamerScreenResolutionInput | null;
   virtualDisplayModes?: readonly StreamerVirtualDisplayModeInput[];
+  // 建连时直接要求被控端补一块虚拟屏(force_virtual_display)并给出初始分辨率。
+  // 官方主控端把这三项放在 ConnectOptions 的 5/6/7 号字段上,而不是走后续 RPC。
+  forceVirtualDisplay?: boolean;
+  virtualDisplayInitResolution?: StreamerScreenResolutionInput | null;
 }
 
 const protobufWireType = {
   varint: 0,
+  fixed64: 1,
   lengthDelimited: 2,
+  fixed32: 5,
 } as const;
 
 const textEncoder = new TextEncoder();
@@ -959,6 +1475,8 @@ export function buildDefaultStreamerConnectOptionsBase64(input: BuildDefaultStre
     },
     decoderCapList: [buildDefaultStreamerDecoderCap()],
     virtualDisplayModes: input.virtualDisplayModes ?? [STREAMER_DEFAULT_BROWSER_VIRTUAL_DISPLAY_MODE],
+    forceVirtualDisplay: input.forceVirtualDisplay ?? false,
+    virtualDisplayInitResolution: input.virtualDisplayInitResolution ?? null,
     clientType: STREAMER_CLIENT_TYPES.Client_ANDROID,
     controlConnectType: input.controlConnectType ?? STREAMER_CONTROL_CONNECT_TYPES.ControlConnectType_Normal,
     featureFlags: STREAMER_DEFAULT_FEATURE_FLAGS,
@@ -1203,6 +1721,23 @@ function readProtobufFields(bytes: Uint8Array): ProtobufField[] {
       if (!Number.isSafeInteger(byteLength) || byteLength < 0 || offset + byteLength > bytes.byteLength) break;
       fields.push({ tag, wireType, bytes: bytes.slice(offset, offset + byteLength) });
       offset += byteLength;
+      continue;
+    }
+
+    // fixed64(1) / fixed32(5):Screen.dpr 是 double、dpi_scale 是 float。
+    // 必须跳过而不是 break——否则 dpr 之后的所有字段(display_name、resolution_type、
+    // video_track_index)都会丢，表现为「屏幕有名字却是空、第二块屏拿不到轨道号」。
+    if (wireType === protobufWireType.fixed64) {
+      if (offset + 8 > bytes.byteLength) break;
+      fields.push({ tag, wireType, bytes: bytes.slice(offset, offset + 8) });
+      offset += 8;
+      continue;
+    }
+
+    if (wireType === protobufWireType.fixed32) {
+      if (offset + 4 > bytes.byteLength) break;
+      fields.push({ tag, wireType, bytes: bytes.slice(offset, offset + 4) });
+      offset += 4;
       continue;
     }
 

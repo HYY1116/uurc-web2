@@ -26,6 +26,7 @@ import {
   encodeStreamerEchoResponseMessage,
   encodeStreamerEchoRequestMessage,
   encodeStreamerInputMessage,
+  encodeStreamerSwitchScreenMessage,
   encodeStreamerTextMessage,
 } from "@uurc/shared/streamerProtocol";
 import { BrowserRemoteSession } from "../src/remote/browserRemoteSession.js";
@@ -1915,7 +1916,135 @@ describe("BrowserRemoteSession", () => {
     session.releaseAllInputs();
     expect(control?.sent).toEqual([]);
   });
+
+  it("tracks the multi-monitor screen list pushed by the controlled side", async () => {
+    const api = new FakeRemoteApi();
+    const peer = new FakePeerConnection();
+    const session = new BrowserRemoteSession({
+      api,
+      createPeerConnection: () => peer,
+      now: () => 4000,
+    });
+    await session.start({ appControlId: "control-1", appDataBase64: "Cg==", streamerData: "{}" });
+
+    await session.applySignalEvents([
+      makeScreenSourcesEvent(30, [
+        { id: 0, screen_type: 0, is_primary_screen: true, display_name: "DP-1", current_resolution: { width: 2560, height: 1440 } },
+        { id: 1, screen_type: 1, display_name: "UU Virtual Display", current_resolution: { width: 1920, height: 1080 } },
+      ], 1),
+    ]);
+
+    const state = session.getState();
+    expect(state.currentScreenId).toBe(1);
+    expect(state.remoteScreens?.map((screen) => screen.id)).toEqual([0, 1]);
+    expect(state.remoteScreens?.[1].displayName).toBe("UU Virtual Display");
+    // 输入索引必须跟着当前采集屏走，否则键鼠会打到别的显示器上。
+    expect(state.remoteInputDisplayId).toBe(1);
+  });
+
+  it("switches the captured screen through a capture_setting rpc instead of swapping local video", async () => {
+    const api = new FakeRemoteApi();
+    const peer = new FakePeerConnection();
+    const session = new BrowserRemoteSession({
+      api,
+      createPeerConnection: () => peer,
+      now: () => 4500,
+    });
+    await session.start({ appControlId: "control-1", appDataBase64: "Cg==", streamerData: "{}" });
+    const control = peer.channels.get(STREAMER_DATA_CHANNEL_LABELS.control)!;
+    control.sent.length = 0;
+
+    session.sendSwitchScreen(2);
+
+    const sent = control.sent[0] as Uint8Array;
+    expect(sent).toBeInstanceOf(Uint8Array);
+    expect(Array.from(sent)).toEqual(
+      Array.from(
+        encodeStreamerSwitchScreenMessage({
+          seq: 1,
+          timestampMs: 4,
+          screenId: 2,
+          cursorCapture: true,
+          requestId: 1,
+        }),
+      ),
+    );
+    // 本地立刻把当前屏切过去，后续输入不必等被控端回推清单。
+    expect(session.getState().currentScreenId).toBe(2);
+    expect(session.getState().remoteInputDisplayId).toBe(2);
+  });
+
+  it("keeps input display ids pinned to the switched screen", async () => {
+    const api = new FakeRemoteApi();
+    const peer = new FakePeerConnection();
+    const session = new BrowserRemoteSession({
+      api,
+      createPeerConnection: () => peer,
+      now: () => 5000,
+    });
+    await session.start({ appControlId: "control-1", appDataBase64: "Cg==", streamerData: "{}" });
+    await session.applySignalEvents([
+      makeScreenSourcesEvent(31, [{ id: 0, screen_type: 0, is_primary_screen: true }], 0),
+    ]);
+
+    session.sendSwitchScreen(3);
+    const control = peer.channels.get(STREAMER_DATA_CHANNEL_LABELS.control)!;
+    control.sent.length = 0;
+    session.sendKeyboardInput({ action: "keyboardPress", value: "A" });
+
+    expect(control.sent).toEqual([
+      encodeStreamerInputMessage({
+        sequence: 2,
+        timestampMs: 5,
+        inputMessage: buildStreamerKeyboardInputMessage({ action: "keyboardPress", value: "A" }),
+        displayId: 3,
+      }),
+    ]);
+  });
+
+  it("ignores redundant screen pushes so periodic refreshes do not re-render", async () => {
+    const api = new FakeRemoteApi();
+    const peer = new FakePeerConnection();
+    const session = new BrowserRemoteSession({
+      api,
+      createPeerConnection: () => peer,
+      now: () => 6000,
+    });
+    await session.start({ appControlId: "control-1", appDataBase64: "Cg==", streamerData: "{}" });
+
+    const event = makeScreenSourcesEvent(32, [{ id: 0, screen_type: 0, is_primary_screen: true }], 0);
+    await session.applySignalEvents([event]);
+    const firstState = session.getState();
+    await session.applySignalEvents([{ ...event, id: 33 }]);
+    const secondState = session.getState();
+
+    expect(secondState.remoteScreens).toEqual(firstState.remoteScreens);
+    expect(
+      secondState.debugEvents.filter((item) => item.summary === "更新受控端屏幕清单").length,
+    ).toBe(1);
+  });
 });
+
+function makeScreenSourcesEvent(
+  id: number,
+  screens: Array<Record<string, unknown>>,
+  currentScreenId: number,
+): RemoteSignalGatewayEvent {
+  return {
+    id,
+    direction: "inbound",
+    event: "device_capability",
+    receivedAt: `2026-05-15T00:00:0${id % 10}.000Z`,
+    payload: {
+      client_id: "controlled-1",
+      data: {
+        type: "screen_sources",
+        current_screen_id: currentScreenId,
+        screens,
+      },
+    },
+  };
+}
 
 function soacEvent(id: number, payload: unknown): RemoteSignalGatewayEvent {
   return {

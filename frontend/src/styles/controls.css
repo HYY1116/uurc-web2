@@ -444,6 +444,16 @@
   color: var(--warn);
 }
 
+/* 「创建虚拟屏」：次要动作，与上方显示器列表按钮区分开，避免误点到切换。 */
+.video-source-create {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  min-height: 32px;
+  font-size: 12px;
+}
+
 /* 连接质量“更多指标”：默认收起的诊断信息，减少常驻信息密度。 */
 .quality-more > summary {
   cursor: pointer;
