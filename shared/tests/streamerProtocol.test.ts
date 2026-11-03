@@ -49,6 +49,9 @@ import {
   buildStreamerImeControlInputMessage,
   buildStreamerImeTextInputMessage,
   buildStreamerKeyboardInputMessage,
+  buildStreamerGamepadConnectMessage,
+  buildStreamerGamepadDisconnectMessage,
+  buildStreamerGamepadInputMessage,
   buildStreamerMacKeyboardInputMessage,
   buildStreamerMacMouseMoveAbsoluteInputMessage,
   buildStreamerMacMouseScrollInputMessage,
@@ -1165,6 +1168,44 @@ describe("streamer protocol constants", () => {
     expect(buildStreamerKeyboardInputMessage({ action: "keyboardClick", value: "A" })).toBe(
       '{"action":"kbd_click","key":"A"}',
     );
+    expect(buildStreamerGamepadConnectMessage(0)).toBe('{"action":"gpd_connect","index":0}');
+    expect(
+      buildStreamerGamepadInputMessage({
+        index: 0,
+        id: "Xbox Wireless Controller",
+        mapping: "standard",
+        axes: [0.5, -0.5, -1, 1],
+        buttons: Array.from({ length: 17 }, (_, index) => ({
+          pressed: [0, 4, 9, 12, 16].includes(index),
+          touched: false,
+          value: index === 6 ? 0.5 : index === 7 ? 1 : [0, 4, 9, 12, 16].includes(index) ? 1 : 0,
+        })),
+        timestamp: 123.9,
+      }),
+    ).toBe(
+      '{"action":"gpd_update","index":0,"buttons":5393,"left_trigger":127,"right_trigger":255,"left_thumb_x":16383,"left_thumb_y":16383,"right_thumb_x":-32767,"right_thumb_y":-32767}',
+    );
+    expect(
+      buildStreamerGamepadInputMessage({
+        index: 0,
+        axes: [0, 0, 0, 0],
+        buttons: Array.from({ length: 8 }, (_, index) => ({
+          pressed: index === 6,
+          value: index === 6 ? 0.11 : index === 7 ? 0.5 : 0,
+        })),
+      }),
+    ).toContain('"left_trigger":28,"right_trigger":127');
+    expect(
+      buildStreamerGamepadInputMessage({
+        index: 7,
+        axes: [Number.NaN, 2, -2, Number.NaN],
+        buttons: [{ pressed: false, value: 0 }],
+        reset: true,
+      }),
+    ).toBe(
+      '{"action":"gpd_update","index":3,"buttons":0,"left_trigger":0,"right_trigger":0,"left_thumb_x":0,"left_thumb_y":-32767,"right_thumb_x":-32767,"right_thumb_y":0}',
+    );
+    expect(buildStreamerGamepadDisconnectMessage(2)).toBe('{"action":"gpd_disconnect","index":2}');
   });
 
   it("builds verified Android-to-Mac InputManager output messages", () => {

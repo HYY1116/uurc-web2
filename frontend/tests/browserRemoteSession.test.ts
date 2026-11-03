@@ -17,6 +17,9 @@ import {
   buildStreamerMacMouseMoveAbsoluteInputMessage,
   buildStreamerMacMouseScrollInputMessage,
   buildStreamerWindowsKeyboardInputMessage,
+  buildStreamerGamepadConnectMessage,
+  buildStreamerGamepadDisconnectMessage,
+  buildStreamerGamepadInputMessage,
   buildStreamerTextInputMessage,
   buildStreamerMouseMoveAbsoluteInputMessage,
   buildStreamerMouseScrollInputMessage,
@@ -1053,6 +1056,117 @@ describe("BrowserRemoteSession", () => {
     ]);
   });
 
+  it("sends desktop gamepad input as raw control JSON", async () => {
+    const api = new FakeRemoteApi();
+    const peer = new FakePeerConnection();
+    const session = new BrowserRemoteSession({
+      api,
+      createPeerConnection: (configuration) => {
+        peer.configuration = configuration;
+        return peer;
+      },
+      now: () => 2600,
+    });
+    await session.start({
+      appControlId: "control-1",
+      appDataBase64: "Cg==",
+      streamerData: "{}",
+      targetPlatform: 1,
+    });
+
+    const input = {
+      index: 0,
+      id: "Xbox Wireless Controller",
+      mapping: "standard",
+      axes: [0, 0.5, 0, -1],
+      buttons: [{ pressed: true, touched: true, value: 1 }],
+      timestamp: 123,
+    };
+    session.sendGamepadInput(input);
+
+    expect(peer.channels.get(STREAMER_DATA_CHANNEL_LABELS.control)?.sent).toEqual([
+      buildStreamerGamepadConnectMessage(0),
+      buildStreamerGamepadInputMessage(input),
+    ]);
+    expect(session.getState().debugEvents.at(-1)?.details).toMatchObject({
+      route: "control_event",
+      input: {
+        action: "gpd_update",
+        index: 0,
+        buttons: 4096,
+        leftThumbY: -16383,
+        rightThumbY: 32767,
+      },
+    });
+  });
+
+  it("preserves analog trigger values after the browser pressed threshold", async () => {
+    const api = new FakeRemoteApi();
+    const peer = new FakePeerConnection();
+    const session = new BrowserRemoteSession({
+      api,
+      createPeerConnection: (configuration) => {
+        peer.configuration = configuration;
+        return peer;
+      },
+    });
+    await session.start({ appControlId: "control-1", appDataBase64: "Cg==", streamerData: "{}" });
+
+    session.sendGamepadInput({
+      index: 0,
+      id: "Trigger Probe Pad",
+      mapping: "standard",
+      axes: [0, 0, 0, 0],
+      buttons: Array.from({ length: 8 }, (_, index) => ({
+        pressed: index === 6,
+        value: index === 6 ? 0.11 : index === 7 ? 0.5 : 0,
+      })),
+    });
+
+    expect(session.getState().debugEvents.at(-1)?.details).toMatchObject({
+      gamepadId: "Trigger Probe Pad",
+      mapping: "standard",
+      rawAxes: [0, 0, 0, 0],
+      rawLeftTrigger: 0.11,
+      leftTriggerPressed: true,
+      encodedLeftTrigger: 28,
+      rawRightTrigger: 0.5,
+      encodedRightTrigger: 127,
+    });
+  });
+
+  it("maps sparse browser gamepad indexes onto the App's four logical slots", async () => {
+    const api = new FakeRemoteApi();
+    const peer = new FakePeerConnection();
+    const session = new BrowserRemoteSession({
+      api,
+      createPeerConnection: (configuration) => {
+        peer.configuration = configuration;
+        return peer;
+      },
+    });
+    await session.start({ appControlId: "control-1", appDataBase64: "Cg==", streamerData: "{}" });
+
+    const input = {
+      index: 7,
+      id: "Xbox Wireless Controller",
+      mapping: "standard",
+      axes: [0, 0, 0, 0],
+      buttons: [{ pressed: false, touched: false, value: 0 }],
+    };
+    session.sendGamepadInput(input);
+    session.sendGamepadInput({ ...input, axes: [0.5, 0, 0, 0] });
+    session.sendGamepadInput({ ...input, reset: true });
+
+    expect(peer.channels.get(STREAMER_DATA_CHANNEL_LABELS.control)?.sent).toEqual([
+      buildStreamerGamepadConnectMessage(0),
+      buildStreamerGamepadInputMessage({ ...input, index: 0 }),
+      buildStreamerGamepadInputMessage({ ...input, index: 0, axes: [0.5, 0, 0, 0] }),
+      buildStreamerGamepadInputMessage({ ...input, index: 0, reset: true }),
+      buildStreamerGamepadDisconnectMessage(0),
+    ]);
+  });
+
   it("transforms browser input through the Windows server keymap shape for Windows targets", async () => {
     const api = new FakeRemoteApi();
     const peer = new FakePeerConnection();
@@ -1088,6 +1202,39 @@ describe("BrowserRemoteSession", () => {
       buildStreamerWindowsKeyboardInputMessage({ action: "keyboardPress", value: 113 }),
       buildStreamerTextInputMessage("o"),
       buildStreamerMacMouseScrollInputMessage({ deltaX: 0, deltaY: -120 }),
+    ]);
+  });
+
+  it("sends non-desktop gamepad input as App control events without a SendToRom envelope", async () => {
+    const api = new FakeRemoteApi();
+    const peer = new FakePeerConnection();
+    const session = new BrowserRemoteSession({
+      api,
+      createPeerConnection: (configuration) => {
+        peer.configuration = configuration;
+        return peer;
+      },
+      now: () => 3000,
+    });
+    await session.start({
+      appControlId: "control-1",
+      appDataBase64: "Cg==",
+      streamerData: "{}",
+    });
+
+    const input = {
+      index: 0,
+      id: "Xbox Wireless Controller",
+      mapping: "standard",
+      axes: [0, 0.5, 0, -1],
+      buttons: [{ pressed: true, touched: true, value: 1 }],
+      timestamp: 123,
+    };
+    session.sendGamepadInput(input);
+
+    expect(peer.channels.get(STREAMER_DATA_CHANNEL_LABELS.control)?.sent).toEqual([
+      buildStreamerGamepadConnectMessage(0),
+      buildStreamerGamepadInputMessage(input),
     ]);
   });
 
@@ -1717,6 +1864,51 @@ describe("BrowserRemoteSession", () => {
         timestampMs: 9,
         inputMessage: buildStreamerKeyboardInputMessage({ action: "keyboardRelease", value: "A" }),
       }),
+    ]);
+
+    control!.sent.length = 0;
+    session.releaseAllInputs();
+    expect(control?.sent).toEqual([]);
+  });
+
+  it("sends a neutral gamepad frame from releaseAllInputs", async () => {
+    const api = new FakeRemoteApi();
+    const peer = new FakePeerConnection();
+    const session = new BrowserRemoteSession({
+      api,
+      createPeerConnection: (configuration) => {
+        peer.configuration = configuration;
+        return peer;
+      },
+      now: () => 9000,
+    });
+    await session.start({ appControlId: "control-1", appDataBase64: "Cg==", streamerData: "{}" });
+
+    const control = peer.channels.get(STREAMER_DATA_CHANNEL_LABELS.control);
+    const input = {
+      index: 0,
+      id: "Xbox Wireless Controller",
+      mapping: "standard",
+      axes: [0.5, -0.5],
+      buttons: [{ pressed: true, touched: true, value: 1 }],
+      timestamp: 123,
+    };
+    session.sendGamepadInput(input);
+    control!.sent.length = 0;
+
+    session.releaseAllInputs();
+
+    expect(control?.sent).toEqual([
+      buildStreamerGamepadInputMessage({
+        index: 0,
+        id: "Xbox Wireless Controller",
+        mapping: "standard",
+        axes: [0, 0, 0, 0],
+        buttons: Array.from({ length: 17 }, () => ({ pressed: false, touched: false, value: 0 })),
+        timestamp: 123,
+        reset: true,
+      }),
+      buildStreamerGamepadDisconnectMessage(0),
     ]);
 
     control!.sent.length = 0;

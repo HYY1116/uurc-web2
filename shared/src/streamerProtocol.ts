@@ -1418,6 +1418,30 @@ export const STREAMER_DESKTOP_INPUT_EVENT_TYPES = {
 
 export type StreamerDesktopInputEventKind = keyof typeof STREAMER_DESKTOP_INPUT_EVENT_TYPES;
 
+export const STREAMER_GAMEPAD_CONTROL_EVENT_TYPES = {
+  connect: "gpd_connect",
+  update: "gpd_update",
+  disconnect: "gpd_disconnect",
+} as const;
+
+export const STREAMER_GAMEPAD_BUTTON_FLAGS = {
+  dpadUp: 0x0001,
+  dpadDown: 0x0002,
+  dpadLeft: 0x0004,
+  dpadRight: 0x0008,
+  start: 0x0010,
+  select: 0x0020,
+  leftStick: 0x0040,
+  rightStick: 0x0080,
+  leftShoulder: 0x0100,
+  rightShoulder: 0x0200,
+  guide: 0x0400,
+  a: 0x1000,
+  b: 0x2000,
+  x: 0x4000,
+  y: 0x8000,
+} as const;
+
 export const STREAMER_MOUSE_BUTTON_CODES = {
   primary: 1,
   secondary: 2,
@@ -1458,6 +1482,33 @@ export interface BuildStreamerMouseScrollInputMessageInput {
 export interface BuildStreamerKeyboardInputMessageInput {
   action: "keyboardPress" | "keyboardRelease" | "keyboardClick";
   value: string | number;
+}
+
+export interface StreamerGamepadButtonState {
+  pressed: boolean;
+  touched?: boolean;
+  value: number;
+}
+
+export interface BuildStreamerGamepadInputMessageInput {
+  index: number;
+  id?: string;
+  mapping?: string;
+  axes: readonly number[];
+  buttons: readonly StreamerGamepadButtonState[];
+  timestamp?: number;
+  reset?: boolean;
+}
+
+export interface StreamerGamepadUpdateState {
+  index: number;
+  buttons: number;
+  leftTrigger: number;
+  rightTrigger: number;
+  leftThumbX: number;
+  leftThumbY: number;
+  rightThumbX: number;
+  rightThumbY: number;
 }
 
 export const STREAMER_ANDROID_TO_MAC_KEY_CODES: Readonly<Record<number, number>> = {
@@ -1672,6 +1723,51 @@ export function buildStreamerKeyboardInputMessage(input: BuildStreamerKeyboardIn
   });
 }
 
+export function buildStreamerGamepadConnectMessage(index: number): string {
+  return JSON.stringify({
+    action: STREAMER_GAMEPAD_CONTROL_EVENT_TYPES.connect,
+    index: normalizeStreamerGamepadIndex(index),
+  });
+}
+
+export function buildStreamerGamepadUpdateMessage(input: StreamerGamepadUpdateState): string {
+  return JSON.stringify({
+    action: STREAMER_GAMEPAD_CONTROL_EVENT_TYPES.update,
+    index: normalizeStreamerGamepadIndex(input.index),
+    buttons: normalizeStreamerGamepadButtonFlags(input.buttons),
+    left_trigger: normalizeStreamerGamepadTrigger(input.leftTrigger),
+    right_trigger: normalizeStreamerGamepadTrigger(input.rightTrigger),
+    left_thumb_x: normalizeStreamerGamepadThumbAxis(input.leftThumbX),
+    left_thumb_y: normalizeStreamerGamepadThumbAxis(input.leftThumbY),
+    right_thumb_x: normalizeStreamerGamepadThumbAxis(input.rightThumbX),
+    right_thumb_y: normalizeStreamerGamepadThumbAxis(input.rightThumbY),
+  });
+}
+
+export function buildStreamerGamepadDisconnectMessage(index: number): string {
+  return JSON.stringify({
+    action: STREAMER_GAMEPAD_CONTROL_EVENT_TYPES.disconnect,
+    index: normalizeStreamerGamepadIndex(index),
+  });
+}
+
+export function buildStreamerGamepadInputMessage(input: BuildStreamerGamepadInputMessageInput): string {
+  return buildStreamerGamepadUpdateMessage(toStreamerGamepadUpdateState(input));
+}
+
+export function toStreamerGamepadUpdateState(input: BuildStreamerGamepadInputMessageInput): StreamerGamepadUpdateState {
+  return {
+    index: normalizeStreamerGamepadIndex(input.index),
+    buttons: readStreamerGamepadButtonFlags(input.buttons),
+    leftTrigger: readStreamerGamepadButtonValue(input.buttons, 6),
+    rightTrigger: readStreamerGamepadButtonValue(input.buttons, 7),
+    leftThumbX: readStreamerGamepadAxis(input.axes, 0),
+    leftThumbY: -readStreamerGamepadAxis(input.axes, 1),
+    rightThumbX: readStreamerGamepadAxis(input.axes, 2),
+    rightThumbY: -readStreamerGamepadAxis(input.axes, 3),
+  };
+}
+
 export function buildStreamerMacKeyboardInputMessage(input: BuildStreamerKeyboardInputMessageInput): string {
   const key = transformStreamerAndroidKeyCodeToMac(input.value);
   if (key === undefined) return "";
@@ -1708,6 +1804,65 @@ export function transformStreamerAndroidKeyCodeToWindows(value: string | number)
 function normalizeAbsolutePointerAxis(value: number, size: number): number {
   if (!Number.isFinite(value) || !Number.isFinite(size) || size <= 0) return 0;
   return Math.min(1, Math.max(0, value / size));
+}
+
+function normalizeStreamerGamepadIndex(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(3, Math.trunc(value)));
+}
+
+function normalizeStreamerGamepadButtonFlags(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(0xffff, Math.trunc(value)));
+}
+
+function normalizeStreamerGamepadTrigger(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.trunc(Math.min(1, Math.max(0, value)) * 0xff);
+}
+
+function normalizeStreamerGamepadThumbAxis(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.trunc(Math.min(1, Math.max(-1, value)) * 0x7fff);
+}
+
+function readStreamerGamepadAxis(axes: readonly number[], index: number): number {
+  const value = axes[index];
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(1, Math.max(-1, value));
+}
+
+function readStreamerGamepadButtonValue(buttons: readonly StreamerGamepadButtonState[], index: number): number {
+  const button = buttons[index];
+  if (!button || !Number.isFinite(button.value)) return button?.pressed ? 1 : 0;
+  return Math.min(1, Math.max(0, button.value));
+}
+
+function readStreamerGamepadButtonFlags(buttons: readonly StreamerGamepadButtonState[]): number {
+  const buttonFlags = [
+    STREAMER_GAMEPAD_BUTTON_FLAGS.a,
+    STREAMER_GAMEPAD_BUTTON_FLAGS.b,
+    STREAMER_GAMEPAD_BUTTON_FLAGS.x,
+    STREAMER_GAMEPAD_BUTTON_FLAGS.y,
+    STREAMER_GAMEPAD_BUTTON_FLAGS.leftShoulder,
+    STREAMER_GAMEPAD_BUTTON_FLAGS.rightShoulder,
+    0,
+    0,
+    STREAMER_GAMEPAD_BUTTON_FLAGS.select,
+    STREAMER_GAMEPAD_BUTTON_FLAGS.start,
+    STREAMER_GAMEPAD_BUTTON_FLAGS.leftStick,
+    STREAMER_GAMEPAD_BUTTON_FLAGS.rightStick,
+    STREAMER_GAMEPAD_BUTTON_FLAGS.dpadUp,
+    STREAMER_GAMEPAD_BUTTON_FLAGS.dpadDown,
+    STREAMER_GAMEPAD_BUTTON_FLAGS.dpadLeft,
+    STREAMER_GAMEPAD_BUTTON_FLAGS.dpadRight,
+    STREAMER_GAMEPAD_BUTTON_FLAGS.guide,
+  ] as const;
+
+  return buttonFlags.reduce<number>((flags, buttonFlag, index) => {
+    const button = buttons[index];
+    return buttonFlag && (button?.pressed || (button?.value ?? 0) > 0.5) ? flags | buttonFlag : flags;
+  }, 0);
 }
 
 export function createStreamerTouchInputTracker(surface: StreamerTouchSurface): StreamerTouchInputTracker {

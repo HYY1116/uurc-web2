@@ -16,6 +16,7 @@ export function RemoteControlDiagnosticsDrawer({
   debugEvents,
   effectiveConnectionRouteLabel,
   iceControlStatusLabel,
+  gamepadStatusLabel,
   inboundVideoStatsLabel,
   inputControlActive,
   joinModeLabel,
@@ -50,6 +51,7 @@ export function RemoteControlDiagnosticsDrawer({
   | "controlChannelLabel"
   | "debugEvents"
   | "effectiveConnectionRouteLabel"
+  | "gamepadStatusLabel"
   | "iceControlStatusLabel"
   | "inboundVideoStatsLabel"
   | "inputControlActive"
@@ -101,6 +103,7 @@ export function RemoteControlDiagnosticsDrawer({
         <StatusRow label="控制通道" value={controlChannelLabel} />
         <StatusRow label="文本通道" value={textChannelLabel} />
         <StatusRow label="输入控制" value={inputControlActive ? "控制中" : "仅查看"} />
+        <StatusRow label="手柄输入" value={gamepadStatusLabel} />
         <StatusRow label="房间释放" value={roomReleaseLabel} />
         <StatusRow label="释放详情" value={roomReleaseDetail} />
       </div>

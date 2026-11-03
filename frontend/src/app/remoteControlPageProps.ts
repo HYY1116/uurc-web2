@@ -53,6 +53,9 @@ export interface RemoteControlPageProps {
   effectiveConnectionRouteLabel: string;
   error: string;
   forceJoin: boolean;
+  gamepadActive: boolean;
+  gamepadStatusLabel: string;
+  gamepadSupported: boolean;
   hasRemoteVideo: boolean;
   iceControlStatusLabel: string;
   inboundVideoStatsLabel: string;

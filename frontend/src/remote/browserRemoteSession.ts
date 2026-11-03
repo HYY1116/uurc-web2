@@ -1,6 +1,9 @@
 import {
   STREAMER_DATA_CHANNEL_LABELS,
   STREAMER_ICE_NETWORK_TYPES,
+  buildStreamerGamepadConnectMessage,
+  buildStreamerGamepadDisconnectMessage,
+  buildStreamerGamepadInputMessage,
   buildStreamerMouseButtonInputMessage,
   buildStreamerKeyboardInputMessage,
   buildStreamerMacKeyboardInputMessage,
@@ -27,6 +30,8 @@ import {
   type StreamerIceNetworkType,
   type StreamerMouseButtonKind,
   type StreamerSignalControlResult,
+  type BuildStreamerGamepadInputMessageInput,
+  toStreamerGamepadUpdateState,
 } from "@uurc/shared/streamerProtocol";
 import type {
   RemoteSignalControlRequest,
@@ -118,6 +123,8 @@ export interface BrowserRemoteKeyboardInput {
   action: "keyboardPress" | "keyboardRelease" | "keyboardClick";
   value: string | number;
 }
+
+export type BrowserRemoteGamepadInput = BuildStreamerGamepadInputMessageInput;
 
 export interface BrowserRemoteSelectedCandidatePair {
   localCandidateType?: string;
@@ -272,6 +279,8 @@ export class BrowserRemoteSession {
   private sequence = 1;
   private readonly heldKeyboardValues = new Set<string | number>();
   private readonly heldMouseButtons = new Set<StreamerMouseButtonKind | number>();
+  private readonly activeGamepadInputs = new Map<number, BrowserRemoteGamepadInput>();
+  private readonly logicalGamepadIndexByBrowserIndex = new Map<number, number>();
   private previousStatsSample:
     | {
         inboundVideo?: BrowserRemoteInboundVideoStats;
@@ -350,6 +359,8 @@ export class BrowserRemoteSession {
     this.sequence = 1;
     this.heldKeyboardValues.clear();
     this.heldMouseButtons.clear();
+    this.activeGamepadInputs.clear();
+    this.logicalGamepadIndexByBrowserIndex.clear();
     this.previousStatsSample = undefined;
     this.previousVideoElementSample = undefined;
     this.setState({
@@ -485,6 +496,40 @@ export class BrowserRemoteSession {
     this.sendInputData(this.buildKeyboardInput(input));
   }
 
+  sendGamepadInput(input: BrowserRemoteGamepadInput): void {
+    const browserIndex = Math.max(0, Math.trunc(input.index));
+    const existingIndex = this.logicalGamepadIndexByBrowserIndex.get(browserIndex);
+    if (input.reset) {
+      if (existingIndex === undefined || !this.activeGamepadInputs.has(existingIndex)) return;
+      this.sendGamepadControlEvent(buildStreamerGamepadInputMessage({ ...input, index: existingIndex }));
+      this.sendGamepadControlEvent(buildStreamerGamepadDisconnectMessage(existingIndex));
+      this.activeGamepadInputs.delete(existingIndex);
+      this.logicalGamepadIndexByBrowserIndex.delete(browserIndex);
+      return;
+    }
+
+    const index = existingIndex ?? this.claimLogicalGamepadIndex(browserIndex);
+    if (index === undefined) return;
+    if (!this.activeGamepadInputs.has(index)) {
+      this.sendGamepadControlEvent(buildStreamerGamepadConnectMessage(index));
+    }
+    const normalizedInput = { ...input, index };
+    this.activeGamepadInputs.set(index, normalizedInput);
+    const updateState = toStreamerGamepadUpdateState(normalizedInput);
+    this.sendGamepadControlEvent(buildStreamerGamepadInputMessage(normalizedInput), {
+      browserIndex,
+      gamepadId: input.id,
+      mapping: input.mapping,
+      rawAxes: [...input.axes],
+      rawLeftTrigger: input.buttons[6]?.value,
+      rawRightTrigger: input.buttons[7]?.value,
+      leftTriggerPressed: input.buttons[6]?.pressed,
+      rightTriggerPressed: input.buttons[7]?.pressed,
+      encodedLeftTrigger: Math.trunc(updateState.leftTrigger * 0xff),
+      encodedRightTrigger: Math.trunc(updateState.rightTrigger * 0xff),
+    });
+  }
+
   // 直接上屏一段字符(text_input)。桌面被控端打字用它替代逐键 kbd_press，避免字母连发；
   // 走与其他控制输入相同的 sendInputData 通道(桌面为裸 JSON)。
   sendTextInput(content: string): void {
@@ -499,6 +544,9 @@ export class BrowserRemoteSession {
     this.heldMouseButtons.clear();
     const keys = [...this.heldKeyboardValues];
     this.heldKeyboardValues.clear();
+    const gamepads = [...this.activeGamepadInputs.values()];
+    this.activeGamepadInputs.clear();
+    this.logicalGamepadIndexByBrowserIndex.clear();
     for (const button of buttons) {
       try {
         this.sendInputData(buildStreamerMouseButtonInputMessage({ action: "mouseRelease", button }));
@@ -509,6 +557,14 @@ export class BrowserRemoteSession {
     for (const value of keys) {
       try {
         this.sendInputData(this.buildKeyboardInput({ action: "keyboardRelease", value }));
+      } catch {
+        // 忽略。
+      }
+    }
+    for (const gamepad of gamepads) {
+      try {
+        this.sendGamepadControlEvent(buildStreamerGamepadInputMessage(buildNeutralGamepadInput(gamepad)));
+        this.sendGamepadControlEvent(buildStreamerGamepadDisconnectMessage(gamepad.index));
       } catch {
         // 忽略。
       }
@@ -1054,6 +1110,29 @@ export class BrowserRemoteSession {
     this.updateDataChannelState(label);
   }
 
+  private claimLogicalGamepadIndex(browserIndex: number): number | undefined {
+    const usedIndexes = new Set(this.logicalGamepadIndexByBrowserIndex.values());
+    for (let index = 0; index < 4; index += 1) {
+      if (usedIndexes.has(index)) continue;
+      this.logicalGamepadIndexByBrowserIndex.set(browserIndex, index);
+      return index;
+    }
+    return undefined;
+  }
+
+  private sendGamepadControlEvent(inputMessage: string, details?: Record<string, unknown>): void {
+    if (!inputMessage) return;
+    this.sendDataChannel(STREAMER_DATA_CHANNEL_LABELS.control, inputMessage, {
+      summary: "发送手柄控制事件",
+      details: {
+        route: "control_event",
+        targetPlatform: this.targetPlatform,
+        input: summarizeInputMessage(inputMessage),
+        ...details,
+      },
+    });
+  }
+
   private sendInputData(inputMessage: string): void {
     if (!inputMessage) {
       this.recordDebugEvent("data_send", "跳过空控制输入", {
@@ -1304,6 +1383,18 @@ function positive(value: number | undefined): boolean {
   return value !== undefined && value > 0;
 }
 
+function buildNeutralGamepadInput(input: BrowserRemoteGamepadInput): BrowserRemoteGamepadInput {
+  return {
+    index: input.index,
+    id: input.id,
+    mapping: input.mapping,
+    axes: Array.from({ length: Math.max(4, input.axes.length) }, () => 0),
+    buttons: Array.from({ length: Math.max(17, input.buttons.length) }, () => ({ pressed: false, touched: false, value: 0 })),
+    timestamp: input.timestamp,
+    reset: true,
+  };
+}
+
 function formatVideoFlowDelta(delta: BrowserRemoteVideoFlowDelta): string {
   return [
     delta.framesDecoded === undefined ? null : `decoded +${delta.framesDecoded}`,
@@ -1340,6 +1431,14 @@ function summarizeInputMessage(inputMessage: string): Record<string, unknown> {
         delta_y: record.delta_y,
         deltaX: record.deltaX,
         deltaY: record.deltaY,
+        index: record.index,
+        buttons: record.buttons,
+        leftTrigger: record.left_trigger,
+        rightTrigger: record.right_trigger,
+        leftThumbX: record.left_thumb_x,
+        leftThumbY: record.left_thumb_y,
+        rightThumbX: record.right_thumb_x,
+        rightThumbY: record.right_thumb_y,
       });
     }
   } catch {

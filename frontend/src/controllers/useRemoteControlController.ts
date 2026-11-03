@@ -61,6 +61,13 @@ import { readLocalClipboardText } from "../browser/clipboard.js";
 import { formatParticipantMeta } from "../devices/deviceLabels.js";
 import { pickControllableDesktop } from "../devices/deviceSummary.js";
 import { BrowserRemoteSession, type BrowserRemoteSessionState, type BrowserRemoteVideoElementSample } from "../remote/browserRemoteSession.js";
+import {
+  createGamepadInputSampler,
+  formatGamepadStatus,
+  isGamepadApiSupported,
+  readSupportedGamepadsFromNavigator,
+  type BrowserGamepadInput,
+} from "../remote/gamepadInput.js";
 import { remoteShortcutGroupTitleForPlatform, sendRemoteShortcut, type RemoteShortcut } from "../remote/remoteShortcuts.js";
 import {
   createAppControlId,
@@ -120,6 +127,20 @@ function toFriendlyError(message: string): string {
   return text;
 }
 
+function requestGamepadFrame(callback: FrameRequestCallback): number {
+  if (typeof window.requestAnimationFrame === "function") return window.requestAnimationFrame(callback);
+  return window.setTimeout(() => callback(globalThis.performance?.now?.() ?? Date.now()), 16);
+}
+
+function cancelGamepadFrame(id: number): void {
+  if (typeof window.cancelAnimationFrame === "function") window.cancelAnimationFrame(id);
+  else window.clearTimeout(id);
+}
+
+function isDocumentHidden(): boolean {
+  return typeof document !== "undefined" && document.hidden;
+}
+
 // 手机号前端预校验：中国大陆区号要求 11 位、以 1 开头；其他区号只做非空+纯数字的宽松校验。
 function isValidMobileNumber(regionCode: string, mobile: string): boolean {
   const digits = mobile.trim();
@@ -165,6 +186,10 @@ export function useRemoteControlController() {
   const [decodeStalledStreak, setDecodeStalledStreak] = useState(0);
   const [autoReconnectStatus, setAutoReconnectStatus] = useState("");
   const [inputControlEnabled, setInputControlEnabled] = useState(false);
+  const [gamepadSupported, setGamepadSupported] = useState(() => isGamepadApiSupported());
+  const [gamepadConnectedName, setGamepadConnectedName] = useState("");
+  const [gamepadActive, setGamepadActive] = useState(false);
+  const [gamepadPollingPaused, setGamepadPollingPaused] = useState(false);
   const [sdpTransportMode, setSdpTransportMode] = useState<SdpTransportMode>("gzip");
   const [connectionRouteMode, setConnectionRouteMode] = useState<ConnectionRouteMode>("auto");
   const [autoConnect, setAutoConnect] = useState<boolean>(readAutoConnectPref);
@@ -180,6 +205,9 @@ export function useRemoteControlController() {
   const remoteStageFrameRef = useRef<HTMLDivElement | null>(null);
   const autoConnectAttemptedDeviceRef = useRef<string>("");
   const controlChannelOpenedRef = useRef(false);
+  const gamepadSamplerRef = useRef(createGamepadInputSampler());
+  const gamepadAnimationFrameRef = useRef<number | null>(null);
+  const gamepadUiStateRef = useRef({ supported: gamepadSupported, connectedName: "", active: false });
   const activePointerId = useRef<number | null>(null);
   const navigate = useNavigate();
   const controlRouteMatch = useMatch("/devices/:deviceId/control");
@@ -624,7 +652,58 @@ export function useRemoteControlController() {
     navigate("/devices");
   }
 
+  function sendGamepadSamples(samples: BrowserGamepadInput[]): void {
+    const session = browserRemoteSession.current;
+    if (!session) return;
+    for (const sample of samples) {
+      try {
+        session.sendGamepadInput(sample);
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : String(caught));
+      }
+    }
+  }
+
+  function updateGamepadUiState(next: { supported: boolean; connectedName: string; active: boolean }): void {
+    const current = gamepadUiStateRef.current;
+    if (current.supported === next.supported && current.connectedName === next.connectedName && current.active === next.active) return;
+    gamepadUiStateRef.current = next;
+    setGamepadSupported(next.supported);
+    setGamepadConnectedName(next.connectedName);
+    setGamepadActive(next.active);
+  }
+
+  function refreshGamepadPresence(active = gamepadActive): void {
+    const supported = isGamepadApiSupported();
+    if (!supported) {
+      updateGamepadUiState({ supported: false, connectedName: "", active: false });
+      return;
+    }
+    const activeGamepad = gamepadSamplerRef.current.getActiveGamepads()[0];
+    const connectedGamepad = activeGamepad ?? readSupportedGamepadsFromNavigator()[0];
+    updateGamepadUiState({
+      supported: true,
+      connectedName: connectedGamepad?.id ?? "",
+      active: active && Boolean(activeGamepad),
+    });
+  }
+
+  function releaseGamepadSamplerInputs(): void {
+    sendGamepadSamples(gamepadSamplerRef.current.reset());
+    refreshGamepadPresence(false);
+  }
+
+  function stopGamepadPolling(options: { paused?: boolean } = {}): void {
+    if (gamepadAnimationFrameRef.current !== null) {
+      cancelGamepadFrame(gamepadAnimationFrameRef.current);
+      gamepadAnimationFrameRef.current = null;
+    }
+    releaseGamepadSamplerInputs();
+    if (options.paused) setGamepadPollingPaused(true);
+  }
+
   function resetBrowserRemoteSession() {
+    stopGamepadPolling();
     const closedState = browserRemoteSession.current?.close();
     browserRemoteSession.current = null;
     activePointerId.current = null;
@@ -638,6 +717,7 @@ export function useRemoteControlController() {
     if (!authStatus?.deviceId) throw new Error("登录已失效");
     if (!selectedDeviceId) throw new Error("请选择设备");
     if (!options.skipReadinessCheck && !roomReadyForBrowserRtc) throw new Error(browserRtcBlockedReason);
+    stopGamepadPolling();
     setInputControlEnabled(false);
     const appControlId = createAppControlId();
     const session = new BrowserRemoteSession({
@@ -849,10 +929,13 @@ export function useRemoteControlController() {
 
   function handleToggleInputControl() {
     if (inputControlActive) {
+      stopGamepadPolling();
+      browserRemoteSession.current?.releaseAllInputs();
       setInputControlEnabled(false);
       return;
     }
     if (controlChannelState !== "open") return;
+    setGamepadPollingPaused(false);
     setInputControlEnabled(true);
     remoteStageRef.current?.focus();
   }
@@ -968,8 +1051,8 @@ export function useRemoteControlController() {
   }
 
   function handleRemoteStageBlur() {
-    // 失焦时把按住的键鼠全部抬起：Alt+Tab、右键菜单、系统快捷键会吞掉 keyup/pointerup，
-    // 否则会在被控端留下卡住的按键（右键卡死、Alt 卡死等）。
+    // 失焦时把按住的键鼠/手柄全部抬起：Alt+Tab、右键菜单、系统快捷键会吞掉 keyup/pointerup，
+    // 否则会在被控端留下卡住的按键（右键卡死、Alt 卡死、摇杆不归零等）。
     activePointerId.current = null;
     browserRemoteSession.current?.releaseAllInputs();
   }
@@ -1061,6 +1144,11 @@ export function useRemoteControlController() {
     : controlChannelState === "open"
       ? "仅查看"
       : controlChannelLabel;
+  const gamepadStatusLabel = formatGamepadStatus({
+    supported: gamepadSupported,
+    active: gamepadActive && inputControlActive,
+    connectedName: gamepadConnectedName || undefined,
+  });
   const decodeStalledPersisted =
     browserRemoteState.videoFlow?.status === "decode_stalled" && decodeStalledStreak >= 2;
   const browserConnectionRecoverable =
@@ -1195,6 +1283,8 @@ export function useRemoteControlController() {
 
   useEffect(() => {
     if (controlChannelState !== "open" && inputControlEnabled) {
+      stopGamepadPolling();
+      browserRemoteSession.current?.releaseAllInputs();
       setInputControlEnabled(false);
     }
   }, [controlChannelState, inputControlEnabled]);
@@ -1210,6 +1300,57 @@ export function useRemoteControlController() {
     setInputControlEnabled(true);
     remoteStageRef.current?.focus();
   }, [controlChannelState]);
+
+  useEffect(() => {
+    const onGamepadConnected = () => refreshGamepadPresence(inputControlActive);
+    const onGamepadDisconnected = () => {
+      releaseGamepadSamplerInputs();
+      refreshGamepadPresence(inputControlActive);
+    };
+    refreshGamepadPresence(inputControlActive);
+    window.addEventListener("gamepadconnected", onGamepadConnected);
+    window.addEventListener("gamepaddisconnected", onGamepadDisconnected);
+    return () => {
+      window.removeEventListener("gamepadconnected", onGamepadConnected);
+      window.removeEventListener("gamepaddisconnected", onGamepadDisconnected);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 手柄事件只需要当前渲染的低频状态；helper 函数在每次渲染重建。
+  }, [inputControlActive]);
+
+  useEffect(() => {
+    if (gamepadPollingPaused) return;
+    if (!inputControlActive || !browserRemoteSession.current || !isGamepadApiSupported()) {
+      stopGamepadPolling();
+      return;
+    }
+    if (isDocumentHidden()) {
+      stopGamepadPolling({ paused: true });
+      return;
+    }
+    let stopped = false;
+    const pollGamepads = () => {
+      if (stopped) return;
+      const samples = gamepadSamplerRef.current.pollFromNavigator();
+      sendGamepadSamples(samples);
+      const activeGamepad = gamepadSamplerRef.current.getActiveGamepads()[0];
+      const connectedGamepad = activeGamepad ?? readSupportedGamepadsFromNavigator()[0];
+      updateGamepadUiState({
+        supported: true,
+        connectedName: connectedGamepad?.id ?? "",
+        active: Boolean(activeGamepad),
+      });
+      gamepadAnimationFrameRef.current = requestGamepadFrame(pollGamepads);
+    };
+    pollGamepads();
+    return () => {
+      stopped = true;
+      if (gamepadAnimationFrameRef.current !== null) {
+        cancelGamepadFrame(gamepadAnimationFrameRef.current);
+        gamepadAnimationFrameRef.current = null;
+      }
+      releaseGamepadSamplerInputs();
+    };
+  }, [inputControlActive, gamepadPollingPaused]);
 
   useEffect(() => {
     try {
@@ -1262,18 +1403,31 @@ export function useRemoteControlController() {
   ]);
 
   useEffect(() => {
-    const releaseHeldInputs = () => browserRemoteSession.current?.releaseAllInputs();
-    const onVisibilityChange = () => {
-      if (document.hidden) releaseHeldInputs();
+    const releaseHeldInputs = () => {
+      stopGamepadPolling({ paused: true });
+      browserRemoteSession.current?.releaseAllInputs();
     };
-    // 切换到其它应用/标签页（Alt+Tab、Win+D 等系统快捷键会抢走焦点）时，抬起所有按住的键鼠。
+    const resumeGamepadPolling = () => {
+      setGamepadPollingPaused(false);
+      refreshGamepadPresence(inputControlActive);
+    };
+    const onVisibilityChange = () => {
+      if (isDocumentHidden()) {
+        releaseHeldInputs();
+        return;
+      }
+      resumeGamepadPolling();
+    };
+    // 切换到其它应用/标签页（Alt+Tab、Win+D 等系统快捷键会抢走焦点）时，抬起所有按住的键鼠/手柄。
     window.addEventListener("blur", releaseHeldInputs);
+    window.addEventListener("focus", resumeGamepadPolling);
     document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
       window.removeEventListener("blur", releaseHeldInputs);
+      window.removeEventListener("focus", resumeGamepadPolling);
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, []);
+  }, [inputControlActive]);
 
   useEffect(() => {
     const stage = remoteStageRef.current;
@@ -1393,6 +1547,9 @@ export function useRemoteControlController() {
     effectiveConnectionRouteLabel,
     error,
     forceJoin,
+    gamepadActive,
+    gamepadStatusLabel,
+    gamepadSupported,
     hasRemoteVideo,
     iceControlStatusLabel,
     inboundVideoStatsLabel,
