@@ -9,6 +9,7 @@ import {
   analyzeRemoteSignalReadiness,
   buildDefaultStreamerConnectOptionsBase64,
   buildStreamerControlStreamerDataJson,
+  normalizeStreamerWheelDelta,
 } from "@uurc/shared/streamerProtocol";
 import type {
   AuthStatus,
@@ -1054,7 +1055,11 @@ export function useRemoteControlController() {
     if (!inputControlActive || !browserRemoteSession.current) return;
     event.preventDefault();
     try {
-      browserRemoteSession.current.sendMouseScroll({ deltaX: event.deltaX, deltaY: event.deltaY });
+      // 浏览器 deltaY 向下为正，UU 被控端 delta_y 向上为正，两侧符号相反，
+      // 必须在这里翻转，否则滚轮方向与 Windows 上完全反过来。
+      browserRemoteSession.current.sendMouseScroll(
+        normalizeStreamerWheelDelta({ deltaX: event.deltaX, deltaY: event.deltaY }),
+      );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     }

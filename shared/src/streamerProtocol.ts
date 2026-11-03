@@ -2243,6 +2243,28 @@ export function buildStreamerMouseScrollInputMessage(input: BuildStreamerMouseSc
   });
 }
 
+// 把浏览器的滚轮语义翻译成 UU 被控端的滚轮语义。
+//
+// 浏览器(DOM WheelEvent):向下滚动 deltaY > 0。
+// UU 被控端(Windows 语义):delta_y > 0 表示向上滚。
+// 两者符号相反。官方安卓主控端从触摸手势自行生成 delta,天然符合 Windows 语义,
+// 所以协议层(buildStreamerMouseScrollInputMessage)只是忠实透传、不做翻转;
+// 翻转必须发生在「浏览器输入 → 协议值」这一层,由调用方显式使用本函数完成。
+//
+// 注意:只做符号归一,不改变量级。触屏/触摸手势路径不经过这里,
+// 因此不会影响手指拖动的方向(那一侧本来就是"内容跟随手指"的语义)。
+export function normalizeStreamerWheelDelta(input: BuildStreamerMouseScrollInputMessageInput): {
+  deltaX: number;
+  deltaY: number;
+} {
+  // `-0` 用 `0 - x` 归一成 `0`:JS 的 `-0` 会序列化成 "-0"，
+  // 让对端的整数比较/累加出现意外行为，这里提前抹平。
+  return {
+    deltaX: 0 - input.deltaX,
+    deltaY: 0 - input.deltaY,
+  };
+}
+
 export function buildStreamerMacMouseScrollInputMessage(input: BuildStreamerMouseScrollInputMessageInput): string {
   return JSON.stringify({
     action: STREAMER_DESKTOP_INPUT_EVENT_TYPES.mouseScroll,

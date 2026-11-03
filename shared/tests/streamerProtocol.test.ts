@@ -94,6 +94,8 @@ import {
   analyzeRemoteSignalReadiness,
   normalizeStreamerSignalControlAck,
   STREAMER_CONTROL_RESULT_ICE_SERVER_KEYS,
+  // 新增测试需要导入 normalizeStreamerWheelDelta
+  normalizeStreamerWheelDelta,
   STREAMER_SCREEN_TYPES,
   STREAMER_SCREEN_WIRE_FIELDS,
   STREAMER_UPLINK_WIRE_FIELDS,
@@ -1172,6 +1174,10 @@ describe("streamer protocol constants", () => {
     expect(buildStreamerMouseScrollInputMessage({ deltaX: 0, deltaY: -120 })).toBe(
       '{"action":"mouse_scroll","delta_x":0,"delta_y":-120}',
     );
+    // 编码层保持忠实透传(不做翻转)，翻转只发生在 normalizeStreamerWheelDelta。
+    expect(buildStreamerMouseScrollInputMessage(normalizeStreamerWheelDelta({ deltaX: 0, deltaY: 120 }))).toBe(
+      '{"action":"mouse_scroll","delta_x":0,"delta_y":-120}',
+    );
     expect(buildStreamerKeyboardInputMessage({ action: "keyboardClick", value: "A" })).toBe(
       '{"action":"kbd_click","key":"A"}',
     );
@@ -1341,6 +1347,36 @@ describe("streamer connection path classification", () => {
     expect(classifyStreamerConnectionPath({})).toBe("unknown");
   });
 });
+
+describe("streamer wheel direction normalization", () => {
+  it("inverts the browser wheel sign into the controlled-side Windows convention", () => {
+    // 浏览器:向下滚 deltaY > 0。UU 被控端:delta_y > 0 表示向上滚。两侧符号相反。
+    expect(normalizeStreamerWheelDelta({ deltaX: 0, deltaY: 100 })).toEqual({ deltaX: 0, deltaY: -100 });
+    expect(normalizeStreamerWheelDelta({ deltaX: 0, deltaY: -100 })).toEqual({ deltaX: 0, deltaY: 100 });
+  });
+
+  it("inverts the horizontal axis the same way", () => {
+    expect(normalizeStreamerWheelDelta({ deltaX: 60, deltaY: 0 })).toEqual({ deltaX: -60, deltaY: 0 });
+  });
+
+  it("preserves magnitude so scroll speed is unchanged", () => {
+    const input = { deltaX: 0, deltaY: 123 };
+    const output = normalizeStreamerWheelDelta(input);
+    expect(Math.abs(output.deltaY)).toBe(Math.abs(input.deltaY));
+  });
+
+  it("round-trips: normalizing twice returns the original delta", () => {
+    const input = { deltaX: 12, deltaY: -240 };
+    expect(normalizeStreamerWheelDelta(normalizeStreamerWheelDelta(input))).toEqual(input);
+  });
+
+  it("keeps a zero delta at zero", () => {
+    expect(normalizeStreamerWheelDelta({ deltaX: 0, deltaY: 0 })).toEqual({ deltaX: 0, deltaY: 0 });
+    // 避免出现 -0，它会序列化成 "-0" 并让对端比较逻辑意外不等。
+    expect(Object.is(normalizeStreamerWheelDelta({ deltaX: 0, deltaY: 0 }).deltaY, -0)).toBe(false);
+  });
+});
+
 describe("streamer multi-display and virtual screen protocol", () => {
   it("pins the uplink and screen wire tags recovered from the App", () => {
     expect(STREAMER_UPLINK_WIRE_FIELDS).toEqual({
